@@ -13,7 +13,12 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const NEYNAR_API_KEY = process.env.NEYNAR_API_KEY;
 const FARCASTER_SIGNER_UUID = process.env.FARCASTER_SIGNER_UUID;
 const APP_URL = process.env.APP_URL || 'https://rate-slayer.vercel.app';
-const BASE_RPC_URL = process.env.BASE_RPC_URL || 'https://mainnet.base.org';
+const BASE_RPC_URL_READ = process.env.BASE_RPC_URL_READ || process.env.BASE_RPC_URL || 'https://mainnet.base.org';
+const BASE_RPC_URL_WRITE = process.env.BASE_RPC_URL_WRITE || process.env.BASE_RPC_URL || 'https://mainnet.base.org';
+const RPC_MAX_RETRIES = Number(process.env.RPC_MAX_RETRIES || 5);
+const RPC_BASE_DELAY_MS = Number(process.env.RPC_BASE_DELAY_MS || 500);
+const RPC_MAX_DELAY_MS = Number(process.env.RPC_MAX_DELAY_MS || 8000);
+const RPC_JITTER_MS = Number(process.env.RPC_JITTER_MS || 200);
 
 // Contract ABI
 const CONTRACT_ABI = parseAbi([
@@ -34,59 +39,178 @@ const account = privateKeyToAccount(`0x${PRIVATE_KEY.replace('0x', '')}`);
 
 const publicClient = createPublicClient({
   chain: base,
-  transport: http(BASE_RPC_URL),
+  transport: http(BASE_RPC_URL_READ),
 });
 
 const walletClient = createWalletClient({
   account,
   chain: base,
-  transport: http(BASE_RPC_URL),
+  transport: http(BASE_RPC_URL_WRITE),
 });
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function isRateLimitError(error) {
+  const status = error?.status || error?.cause?.status || error?.cause?.cause?.status;
+  const code = error?.code || error?.cause?.code || error?.cause?.cause?.code;
+  const message = String(error?.message || '').toLowerCase();
+  const details = String(error?.details || '').toLowerCase();
+  const shortMessage = String(error?.shortMessage || '').toLowerCase();
+
+  return (
+    status === 429 ||
+    code === -32016 ||
+    message.includes('rate limit') ||
+    details.includes('rate limit') ||
+    shortMessage.includes('rate limit') ||
+    message.includes('over rate limit') ||
+    details.includes('over rate limit') ||
+    shortMessage.includes('over rate limit')
+  );
+}
+
+async function withRpcRetry(fn, label) {
+  let attempt = 0;
+
+  while (true) {
+    try {
+      return await fn();
+    } catch (error) {
+      attempt += 1;
+      const isRateLimit = isRateLimitError(error);
+
+      if (!isRateLimit || attempt > RPC_MAX_RETRIES) {
+        throw error;
+      }
+
+      const backoff = Math.min(RPC_MAX_DELAY_MS, RPC_BASE_DELAY_MS * (2 ** (attempt - 1)));
+      const jitter = Math.floor(Math.random() * RPC_JITTER_MS);
+      const waitMs = backoff + jitter;
+
+      console.log(`RPC rate limited${label ? ` (${label})` : ''}. Retry ${attempt}/${RPC_MAX_RETRIES} in ${waitMs}ms`);
+      await sleep(waitMs);
+    }
+  }
+}
 
 
 
 async function getCurrentRate() {
-  const rate = await publicClient.readContract({
-    address: CONTRACT_ADDRESS,
-    abi: CONTRACT_ABI,
-    functionName: 'getCurrentRate',
-  });
+  const rate = await withRpcRetry(
+    () => publicClient.readContract({
+      address: CONTRACT_ADDRESS,
+      abi: CONTRACT_ABI,
+      functionName: 'getCurrentRate',
+    }),
+    'getCurrentRate'
+  );
   return Number(rate) / 100; 
 }
 
 async function getTotalPresses() {
-  const presses = await publicClient.readContract({
-    address: CONTRACT_ADDRESS,
-    abi: CONTRACT_ABI,
-    functionName: 'totalPresses',
-  });
+  const presses = await withRpcRetry(
+    () => publicClient.readContract({
+      address: CONTRACT_ADDRESS,
+      abi: CONTRACT_ABI,
+      functionName: 'totalPresses',
+    }),
+    'getTotalPresses'
+  );
   return Number(presses);
 }
 
 async function getTimeUntilNextPress() {
-  const time = await publicClient.readContract({
-    address: CONTRACT_ADDRESS,
-    abi: CONTRACT_ABI,
-    functionName: 'timeUntilNextPress',
-    args: [account.address],
-  });
+  const time = await withRpcRetry(
+    () => publicClient.readContract({
+      address: CONTRACT_ADDRESS,
+      abi: CONTRACT_ABI,
+      functionName: 'timeUntilNextPress',
+      args: [account.address],
+    }),
+    'getTimeUntilNextPress'
+  );
   return Number(time);
+}
+
+async function getPrePressSnapshot() {
+  const [rate, presses, cooldown] = await withRpcRetry(
+    () => publicClient.readContracts({
+      allowFailure: false,
+      contracts: [
+        {
+          address: CONTRACT_ADDRESS,
+          abi: CONTRACT_ABI,
+          functionName: 'getCurrentRate',
+        },
+        {
+          address: CONTRACT_ADDRESS,
+          abi: CONTRACT_ABI,
+          functionName: 'totalPresses',
+        },
+        {
+          address: CONTRACT_ADDRESS,
+          abi: CONTRACT_ABI,
+          functionName: 'timeUntilNextPress',
+          args: [account.address],
+        },
+      ],
+    }),
+    'prePressSnapshot'
+  );
+
+  return {
+    rate: Number(rate) / 100,
+    presses: Number(presses),
+    cooldown: Number(cooldown),
+  };
+}
+
+async function getPostPressSnapshot() {
+  const [rate, presses] = await withRpcRetry(
+    () => publicClient.readContracts({
+      allowFailure: false,
+      contracts: [
+        {
+          address: CONTRACT_ADDRESS,
+          abi: CONTRACT_ABI,
+          functionName: 'getCurrentRate',
+        },
+        {
+          address: CONTRACT_ADDRESS,
+          abi: CONTRACT_ABI,
+          functionName: 'totalPresses',
+        },
+      ],
+    }),
+    'postPressSnapshot'
+  );
+
+  return {
+    rate: Number(rate) / 100,
+    presses: Number(presses),
+  };
 }
 
 async function pressPowell() {
   console.log('🎯 Attempting to press Powell...');
   
-  const { request } = await publicClient.simulateContract({
-    account,
-    address: CONTRACT_ADDRESS,
-    abi: CONTRACT_ABI,
-    functionName: 'press',
-  });
+  const { request } = await withRpcRetry(
+    () => publicClient.simulateContract({
+      account,
+      address: CONTRACT_ADDRESS,
+      abi: CONTRACT_ABI,
+      functionName: 'press',
+    }),
+    'simulatePress'
+  );
 
   const hash = await walletClient.writeContract(request);
   console.log('📝 Transaction sent:', hash);
 
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  const receipt = await withRpcRetry(
+    () => publicClient.waitForTransactionReceipt({ hash }),
+    'waitForReceipt'
+  );
   console.log('✅ Transaction confirmed!');
   
   return receipt;
@@ -133,7 +257,8 @@ async function runAgent() {
     console.log('='.repeat(50) + '\n');
 
     
-    const cooldown = await getTimeUntilNextPress();
+    const preSnapshot = await getPrePressSnapshot();
+    const cooldown = preSnapshot.cooldown;
     if (cooldown > 0) {
       const minutes = Math.floor(cooldown / 60);
       const seconds = cooldown % 60;
@@ -143,8 +268,8 @@ async function runAgent() {
     }
 
     
-    const rateBefore = await getCurrentRate();
-    const pressesBefore = await getTotalPresses();
+    const rateBefore = preSnapshot.rate;
+    const pressesBefore = preSnapshot.presses;
     
     console.log(`📊 Current Rate: ${rateBefore.toFixed(2)}%`);
     console.log(`📈 Total Presses: ${pressesBefore}`);
@@ -156,8 +281,9 @@ async function runAgent() {
     await new Promise(resolve => setTimeout(resolve, 5000));
 
     
-    const rateAfter = await getCurrentRate();
-    const pressesAfter = await getTotalPresses();
+    const postSnapshot = await getPostPressSnapshot();
+    const rateAfter = postSnapshot.rate;
+    const pressesAfter = postSnapshot.presses;
 
     console.log(`\n📉 New Rate: ${rateAfter.toFixed(2)}%`);
     console.log(`🎯 Total Presses: ${pressesAfter}`);
@@ -228,9 +354,10 @@ async function checkStatus() {
   try {
     console.log('\n📊 Rate Slayer Status Check\n');
     
-    const rate = await getCurrentRate();
-    const presses = await getTotalPresses();
-    const cooldown = await getTimeUntilNextPress();
+    const snapshot = await getPrePressSnapshot();
+    const rate = snapshot.rate;
+    const presses = snapshot.presses;
+    const cooldown = snapshot.cooldown;
     
     console.log(`Current Rate: ${rate.toFixed(2)}%`);
     console.log(`Total Presses: ${presses}`);
