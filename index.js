@@ -134,7 +134,7 @@ async function getTimeUntilNextPress() {
 
 async function getPrePressSnapshot() {
   const [rate, presses, cooldown] = await withRpcRetry(
-    () => publicClient.readContracts({
+    () => publicClient.multicall({
       allowFailure: false,
       contracts: [
         {
@@ -167,7 +167,7 @@ async function getPrePressSnapshot() {
 
 async function getPostPressSnapshot() {
   const [rate, presses] = await withRpcRetry(
-    () => publicClient.readContracts({
+    () => publicClient.multicall({
       allowFailure: false,
       contracts: [
         {
