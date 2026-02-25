@@ -31,12 +31,18 @@ cp .env.example .env
 Fill in the following:
 
 ```env
-# Generate a new wallet for the agent
+# Single-agent mode
 PRIVATE_KEY=your_private_key_here
+
+# Multi-agent mode (overrides PRIVATE_KEY when set)
+# AGENT_PRIVATE_KEYS=pk_agent_1,pk_agent_2,pk_agent_3
+# AGENT_NAMES=Slayer-1,Slayer-2,Slayer-3
+# AGENT_RUN_STAGGER_MS=3000
 
 # Get from https://neynar.com (free)
 NEYNAR_API_KEY=your_neynar_api_key
 FARCASTER_SIGNER_UUID=your_signer_uuid
+FARCASTER_POSTS_ENABLED=false
 
 # Already configured
 CONTRACT_ADDRESS=0xeC6AF3c5934F383972bb9980A51EC976099270b8
@@ -60,6 +66,7 @@ The agent needs a small amount of ETH on Base to pay for gas:
 1. Generate a new wallet or use existing one
 2. Send ~0.01 ETH to the agent's address (shown when you run the bot)
 3. The agent will use this to pay for `press()` transactions
+4. If you use multi-agent mode, fund each wallet address
 
 ### 4. Run the agent
 
@@ -73,6 +80,21 @@ node index.js --status
 # Start the agent (runs every hour)
 npm start
 ```
+
+### 5. Multi-agent test mode (optional)
+
+Use multiple wallets inside one process:
+
+```env
+AGENT_PRIVATE_KEYS=pk_agent_1,pk_agent_2,pk_agent_3
+AGENT_NAMES=Slayer-1,Slayer-2,Slayer-3
+AGENT_RUN_STAGGER_MS=3000
+```
+
+Notes:
+- `AGENT_PRIVATE_KEYS` takes precedence over `PRIVATE_KEY`
+- use unique private keys (duplicate keys behave like one wallet with different labels)
+- each wallet has its own cooldown in the contract
 
 ## 🔧 How to get Farcaster credentials
 
@@ -99,6 +121,7 @@ If you want more control, you can use Farcaster's native APIs, but Neynar is muc
 - Reads current Fed rate from contract
 - Executes press transaction
 - Posts result to Farcaster
+- Supports one or many agent wallets in one process
 
 ### Smart Posting
 - Randomized message templates for variety
@@ -106,12 +129,14 @@ If you want more control, you can use Farcaster's native APIs, but Neynar is muc
 - Links to the app
 - Error handling with status updates
 - Posting cadence configurable via `POST_EVERY_N_HOURS`
+- Enable/disable posting via `FARCASTER_POSTS_ENABLED`
 
 ### Monitoring
 - Logs all actions to console
 - Tracks transaction hashes
 - Reports cooldown status
 - Health checks available
+- Runs multi-agent wallets sequentially with configurable stagger
 
 ## 🎮 Example Posts
 

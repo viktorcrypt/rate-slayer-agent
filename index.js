@@ -10,8 +10,18 @@ dotenv.config();
 
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || '0xeC6AF3c5934F383972bb9980A51EC976099270b8';
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const AGENT_PRIVATE_KEYS = (process.env.AGENT_PRIVATE_KEYS || '')
+  .split(',')
+  .map(key => key.trim())
+  .filter(Boolean);
+const AGENT_NAMES = (process.env.AGENT_NAMES || '')
+  .split(',')
+  .map(name => name.trim())
+  .filter(Boolean);
+const AGENT_RUN_STAGGER_MS = Math.max(0, Number(process.env.AGENT_RUN_STAGGER_MS || 3000));
 const NEYNAR_API_KEY = process.env.NEYNAR_API_KEY;
 const FARCASTER_SIGNER_UUID = process.env.FARCASTER_SIGNER_UUID;
+const FARCASTER_POSTS_ENABLED = String(process.env.FARCASTER_POSTS_ENABLED || 'false').toLowerCase() === 'true';
 const APP_URL = process.env.APP_URL || 'https://rate-slayer.vercel.app';
 const BASE_RPC_URL_READ = process.env.BASE_RPC_URL_READ || process.env.BASE_RPC_URL || 'https://mainnet.base.org';
 const BASE_RPC_URL_WRITE = process.env.BASE_RPC_URL_WRITE || process.env.BASE_RPC_URL || 'https://mainnet.base.org';
@@ -75,19 +85,50 @@ function resolveTxDataSuffix() {
 const TX_DATA_SUFFIX = resolveTxDataSuffix();
 
 
-const account = privateKeyToAccount(`0x${PRIVATE_KEY.replace('0x', '')}`);
-
 const publicClient = createPublicClient({
   chain: base,
   transport: http(BASE_RPC_URL_READ),
 });
 
-const walletClient = createWalletClient({
-  account,
-  chain: base,
-  transport: http(BASE_RPC_URL_WRITE),
-  ...(TX_DATA_SUFFIX ? { dataSuffix: TX_DATA_SUFFIX } : {}),
-});
+function normalizePrivateKey(privateKey) {
+  return `0x${privateKey.replace(/^0x/, '')}`;
+}
+
+function resolveAgentPrivateKeys() {
+  if (AGENT_PRIVATE_KEYS.length > 0) {
+    return AGENT_PRIVATE_KEYS;
+  }
+
+  if (PRIVATE_KEY) {
+    return [PRIVATE_KEY];
+  }
+
+  throw new Error('No agent private key found. Set PRIVATE_KEY or AGENT_PRIVATE_KEYS.');
+}
+
+function createAgentContexts() {
+  const privateKeys = resolveAgentPrivateKeys();
+
+  return privateKeys.map((privateKey, index) => {
+    const account = privateKeyToAccount(normalizePrivateKey(privateKey));
+    const name = AGENT_NAMES[index] || `Agent-${index + 1}`;
+    const walletClient = createWalletClient({
+      account,
+      chain: base,
+      transport: http(BASE_RPC_URL_WRITE),
+      ...(TX_DATA_SUFFIX ? { dataSuffix: TX_DATA_SUFFIX } : {}),
+    });
+
+    return {
+      index,
+      name,
+      account,
+      walletClient,
+    };
+  });
+}
+
+const agents = createAgentContexts();
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -136,44 +177,7 @@ async function withRpcRetry(fn, label) {
 
 
 
-async function getCurrentRate() {
-  const rate = await withRpcRetry(
-    () => publicClient.readContract({
-      address: CONTRACT_ADDRESS,
-      abi: CONTRACT_ABI,
-      functionName: 'getCurrentRate',
-    }),
-    'getCurrentRate'
-  );
-  return Number(rate) / 100; 
-}
-
-async function getTotalPresses() {
-  const presses = await withRpcRetry(
-    () => publicClient.readContract({
-      address: CONTRACT_ADDRESS,
-      abi: CONTRACT_ABI,
-      functionName: 'totalPresses',
-    }),
-    'getTotalPresses'
-  );
-  return Number(presses);
-}
-
-async function getTimeUntilNextPress() {
-  const time = await withRpcRetry(
-    () => publicClient.readContract({
-      address: CONTRACT_ADDRESS,
-      abi: CONTRACT_ABI,
-      functionName: 'timeUntilNextPress',
-      args: [account.address],
-    }),
-    'getTimeUntilNextPress'
-  );
-  return Number(time);
-}
-
-async function getPrePressSnapshot() {
+async function getPrePressSnapshot(address, label = 'prePressSnapshot') {
   const [rate, presses, cooldown] = await withRpcRetry(
     () => publicClient.multicall({
       allowFailure: false,
@@ -192,11 +196,11 @@ async function getPrePressSnapshot() {
           address: CONTRACT_ADDRESS,
           abi: CONTRACT_ABI,
           functionName: 'timeUntilNextPress',
-          args: [account.address],
+          args: [address],
         },
       ],
     }),
-    'prePressSnapshot'
+    label
   );
 
   return {
@@ -206,7 +210,7 @@ async function getPrePressSnapshot() {
   };
 }
 
-async function getPostPressSnapshot() {
+async function getPostPressSnapshot(label = 'postPressSnapshot') {
   const [rate, presses] = await withRpcRetry(
     () => publicClient.multicall({
       allowFailure: false,
@@ -223,7 +227,7 @@ async function getPostPressSnapshot() {
         },
       ],
     }),
-    'postPressSnapshot'
+    label
   );
 
   return {
@@ -232,28 +236,31 @@ async function getPostPressSnapshot() {
   };
 }
 
-async function pressPowell() {
-  console.log('🎯 Attempting to press Powell...');
+async function pressPowell(agent) {
+  console.log(`[${agent.name}] Attempting to press Powell...`);
   
   const { request } = await withRpcRetry(
     () => publicClient.simulateContract({
-      account,
+      account: agent.account,
       address: CONTRACT_ADDRESS,
       abi: CONTRACT_ABI,
       functionName: 'press',
       ...(TX_DATA_SUFFIX ? { dataSuffix: TX_DATA_SUFFIX } : {}),
     }),
-    'simulatePress'
+    `simulatePress:${agent.name}`
   );
 
-  const hash = await walletClient.writeContract(request);
-  console.log('📝 Transaction sent:', hash);
+  const hash = await withRpcRetry(
+    () => agent.walletClient.writeContract(request),
+    `writePress:${agent.name}`
+  );
+  console.log(`[${agent.name}] Transaction sent:`, hash);
 
   const receipt = await withRpcRetry(
     () => publicClient.waitForTransactionReceipt({ hash }),
-    'waitForReceipt'
+    `waitForReceipt:${agent.name}`
   );
-  console.log('✅ Transaction confirmed!');
+  console.log(`[${agent.name}] Transaction confirmed!`);
   
   return receipt;
 }
@@ -261,9 +268,14 @@ async function pressPowell() {
 
 
 async function postToFarcaster(text) {
+  if (!FARCASTER_POSTS_ENABLED) {
+    console.log('Farcaster posting disabled by config');
+    return;
+  }
+
   if (!NEYNAR_API_KEY || !FARCASTER_SIGNER_UUID) {
-    console.log('⚠️  Farcaster not configured, skipping post');
-    console.log('📝 Would have posted:', text);
+    console.log('Farcaster not configured, skipping post');
+    console.log('Would have posted:', text);
     return;
   }
 
@@ -272,7 +284,7 @@ async function postToFarcaster(text) {
       'https://api.neynar.com/v2/farcaster/cast',
       {
         signer_uuid: FARCASTER_SIGNER_UUID,
-        text: text,
+        text,
       },
       {
         headers: {
@@ -282,180 +294,169 @@ async function postToFarcaster(text) {
       }
     );
 
-    console.log('✅ Posted to Farcaster:', response.data.cast.hash);
+    console.log('Posted to Farcaster:', response.data.cast.hash);
     return response.data;
   } catch (error) {
-    console.error('❌ Failed to post to Farcaster:', error.response?.data || error.message);
+    console.error('Failed to post to Farcaster:', error.response?.data || error.message);
   }
 }
 
 
-async function runAgent() {
+async function runAgent(agent) {
   try {
     console.log('\n' + '='.repeat(50));
-    console.log('🤖 Rate Slayer Agent Running...');
-    console.log('⏰', new Date().toLocaleString());
-    console.log('💼 Agent Address:', account.address);
+    console.log(`${agent.name} running...`);
+    console.log('Time:', new Date().toLocaleString());
+    console.log('Agent Address:', agent.account.address);
     console.log('='.repeat(50) + '\n');
 
-    
-    const preSnapshot = await getPrePressSnapshot();
+    const preSnapshot = await getPrePressSnapshot(agent.account.address, `prePressSnapshot:${agent.name}`);
     const cooldown = preSnapshot.cooldown;
     if (cooldown > 0) {
       const minutes = Math.floor(cooldown / 60);
       const seconds = cooldown % 60;
-      console.log(`⏳ Cooldown active: ${minutes}m ${seconds}s remaining`);
-      console.log('⏭️  Skipping this run...\n');
+      console.log(`[${agent.name}] Cooldown active: ${minutes}m ${seconds}s remaining`);
+      console.log('Skipping this run...\n');
       return;
     }
 
-    
     const rateBefore = preSnapshot.rate;
     const pressesBefore = preSnapshot.presses;
-    
-    console.log(`📊 Current Rate: ${rateBefore.toFixed(2)}%`);
-    console.log(`📈 Total Presses: ${pressesBefore}`);
 
-    
-    await pressPowell();
+    console.log(`[${agent.name}] Current Rate: ${rateBefore.toFixed(2)}%`);
+    console.log(`[${agent.name}] Total Presses: ${pressesBefore}`);
 
-    
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    await pressPowell(agent);
 
-    
-    const postSnapshot = await getPostPressSnapshot();
+    await sleep(5000);
+
+    const postSnapshot = await getPostPressSnapshot(`postPressSnapshot:${agent.name}`);
     const rateAfter = postSnapshot.rate;
     const pressesAfter = postSnapshot.presses;
 
-    console.log(`\n📉 New Rate: ${rateAfter.toFixed(2)}%`);
-    console.log(`🎯 Total Presses: ${pressesAfter}`);
+    console.log(`\n[${agent.name}] New Rate: ${rateAfter.toFixed(2)}%`);
+    console.log(`[${agent.name}] Total Presses: ${pressesAfter}`);
 
-    
     const messages = [
-      `🤖 AUTO-HIT #${pressesAfter}! 👊\n\nFed Rate: ${rateBefore.toFixed(2)}% → ${rateAfter.toFixed(2)}%\n\nAutonomous agent fighting inflation onchain! 📉\n\n${APP_URL}`,
-      
-      `⚡ Just slapped Powell!\n\nRate: ${rateAfter.toFixed(2)}%\nTotal hits: ${pressesAfter}\n\nKeeping rates low 24/7 💪\n\n${APP_URL}`,
-      
-      `👊 HIT #${pressesAfter} COMPLETE!\n\nFed Rate: ${rateBefore.toFixed(2)}% → ${rateAfter.toFixed(2)}%\n\nNo human in the loop! Pure onchain action 🤖\n\n${APP_URL}`,
-      
-      `🎯 Another one!\n\nPowell took another hit\nRate: ${rateAfter.toFixed(2)}%\nTotal: ${pressesAfter} hits\n\nThe printer goes BRRR 🖨️💸\n\n${APP_URL}`,
-      
-      `📉 Rate update!\n\n${rateBefore.toFixed(2)}% → ${rateAfter.toFixed(2)}%\n\nBot status: Active ✅\nNext hit: 1 hour\n\n${APP_URL}`,
-      
-      `💪 Still fighting!\n\nCurrent Fed Rate: ${rateAfter.toFixed(2)}%\nHits landed: ${pressesAfter}\n\nAutonomous. Relentless. Onchain.\n\n${APP_URL}`,
-      
-      `🚀 Transaction confirmed!\n\nPress #${pressesAfter} successful\nRate impact: -0.01%\nNew rate: ${rateAfter.toFixed(2)}%\n\n${APP_URL}`,
-      
-      `⚡ Rate Slayer Bot reporting in!\n\nLatest hit: Success ✅\nFed Rate: ${rateAfter.toFixed(2)}%\nUptime: 100%\n\n${APP_URL}`,
-      
-      `🎮 Game on!\n\nJust pressed Powell onchain\nRate dropped to ${rateAfter.toFixed(2)}%\nCommunity hits: ${pressesAfter}\n\n${APP_URL}`,
-      
-      `💥 BOOM! Hit landed!\n\n${rateBefore.toFixed(2)}% → ${rateAfter.toFixed(2)}%\n\nAgent working overtime to keep inflation low 📊\n\n${APP_URL}`,
-      
-      `🤖 Beep boop!\n\nExecuted press() function\nGas paid ✅\nRate decreased ✅\nPowell status: 😤\n\n${APP_URL}`,
-      
-      `📊 Hourly update:\n\nFed Rate: ${rateAfter.toFixed(2)}%\nTotal presses: ${pressesAfter}\nNext action: Scheduled\n\nAutonomous agent on Base 🔵\n\n${APP_URL}`,
-      
-      `⚡ Smart contract call complete!\n\nFunction: press()\nRate change: -0.01%\nCurrent: ${rateAfter.toFixed(2)}%\n\nNo humans, just code 🤖\n\n${APP_URL}`,
-      
-      `🎯 Mission accomplished!\n\nHit #${pressesAfter} deployed\nInflation: Decreasing\nPowell: Recovering\n\nWe fight every hour 💪\n\n${APP_URL}`,
-      
-      `💼 Rate Slayer at work!\n\n${rateBefore.toFixed(2)}% → ${rateAfter.toFixed(2)}%\n\nBuilding on Base\nRunning 24/7\nFully autonomous\n\n${APP_URL}`,
+      `[${agent.name}] AUTO-HIT #${pressesAfter}\n\nFed Rate: ${rateBefore.toFixed(2)}% -> ${rateAfter.toFixed(2)}%\n\n${APP_URL}`,
+      `[${agent.name}] Just pressed Powell\n\nRate: ${rateAfter.toFixed(2)}%\nTotal hits: ${pressesAfter}\n\n${APP_URL}`,
+      `[${agent.name}] Hit complete\n\nFed Rate: ${rateBefore.toFixed(2)}% -> ${rateAfter.toFixed(2)}%\n\n${APP_URL}`,
     ];
 
-    
     const hour = new Date().getHours();
-    const shouldPost = hour % POST_EVERY_N_HOURS === 0; 
-    
+    const shouldPost = FARCASTER_POSTS_ENABLED && hour % POST_EVERY_N_HOURS === 0;
+
     if (shouldPost) {
       const randomMessage = messages[Math.floor(Math.random() * messages.length)];
       await postToFarcaster(randomMessage);
+    } else if (!FARCASTER_POSTS_ENABLED) {
+      console.log('Skipping Farcaster post (disabled)');
     } else {
       const nextPostingHour = Math.ceil((hour + 1) / POST_EVERY_N_HOURS) * POST_EVERY_N_HOURS;
-      console.log(`⏭️  Skipping Farcaster post (posting every ${POST_EVERY_N_HOURS} hour(s))`);
-      console.log('📝 Next post scheduled for:', `${nextPostingHour % 24}:00`);
+      console.log(`Skipping Farcaster post (posting every ${POST_EVERY_N_HOURS} hour(s))`);
+      console.log('Next post scheduled for:', `${nextPostingHour % 24}:00`);
     }
 
-    console.log('\n✨ Agent run completed successfully!\n');
-
+    console.log(`\n[${agent.name}] Agent run completed successfully!\n`);
   } catch (error) {
-    console.error('❌ Agent error:', error);
-    
-    
+    console.error(`[${agent.name}] Agent error:`, error);
+
     if (String(error?.message || '').includes('cooldown')) {
-      console.log('ℹ️  Cooldown error - this is normal, will try next hour');
-    } else {
+      console.log('Cooldown error - this is normal, will try next hour');
+    } else if (FARCASTER_POSTS_ENABLED) {
       await postToFarcaster(
-        `⚠️ Rate Slayer Bot encountered an issue\n\nStatus: Investigating\nWill retry next hour\n\n${APP_URL}`
+        `[${agent.name}] Rate Slayer Bot encountered an issue\n\nStatus: Investigating\nWill retry next hour\n\n${APP_URL}`
       );
+    } else {
+      console.log('Skipping Farcaster error post (disabled)');
     }
   }
 }
 
-
-async function checkStatus() {
+async function checkStatus(agent) {
   try {
-    console.log('\n📊 Rate Slayer Status Check\n');
-    
-    const snapshot = await getPrePressSnapshot();
+    console.log(`\n${agent.name} Status Check\n`);
+
+    const snapshot = await getPrePressSnapshot(agent.account.address, `statusSnapshot:${agent.name}`);
     const rate = snapshot.rate;
     const presses = snapshot.presses;
     const cooldown = snapshot.cooldown;
-    
+
     console.log(`Current Rate: ${rate.toFixed(2)}%`);
     console.log(`Total Presses: ${presses}`);
-    console.log(`Agent Address: ${account.address}`);
+    console.log(`Agent Address: ${agent.account.address}`);
     console.log(`Cooldown: ${cooldown}s`);
-    
+
     if (cooldown === 0) {
-      console.log('\n✅ Ready to press!');
+      console.log('\nReady to press!');
     } else {
       const minutes = Math.floor(cooldown / 60);
-      console.log(`\n⏳ Next press available in ${minutes} minutes`);
+      console.log(`\nNext press available in ${minutes} minutes`);
     }
   } catch (error) {
-    console.error('❌ Status check error:', error);
+    console.error(`[${agent.name}] Status check error:`, error);
   }
 }
 
+async function runAllAgents(mode) {
+  for (let i = 0; i < agents.length; i++) {
+    const agent = agents[i];
 
+    if (mode === 'status') {
+      await checkStatus(agent);
+    } else {
+      await runAgent(agent);
+    }
+
+    const shouldWait = i < agents.length - 1 && AGENT_RUN_STAGGER_MS > 0;
+    if (shouldWait) {
+      console.log(`Waiting ${AGENT_RUN_STAGGER_MS}ms before next agent...`);
+      await sleep(AGENT_RUN_STAGGER_MS);
+    }
+  }
+}
 
 async function startAgent() {
-  console.log('\n🚀 Rate Slayer Agent Started!\n');
-  console.log('⏰ Will run every hour on the hour');
-  console.log('💼 Agent wallet:', account.address);
-  console.log('📍 Contract:', CONTRACT_ADDRESS);
-  console.log('📰 Farcaster posting cadence:', `every ${POST_EVERY_N_HOURS} hour(s)`);
-  console.log('🏷️  Builder attribution:', TX_DATA_SUFFIX ? 'enabled' : 'disabled');
+  console.log('\nRate Slayer Agent Started!\n');
+  console.log('Will run every hour on the hour');
+  console.log('Agents configured:', agents.length);
+  for (const agent of agents) {
+    console.log(`Agent ${agent.name}: ${agent.account.address}`);
+  }
+  const uniqueAgentCount = new Set(agents.map(agent => agent.account.address.toLowerCase())).size;
+  if (uniqueAgentCount !== agents.length) {
+    console.log('WARNING: Duplicate agent addresses detected. Use unique private keys for true multi-agent behavior.');
+  }
+  console.log('Contract:', CONTRACT_ADDRESS);
+  console.log('Farcaster posting:', FARCASTER_POSTS_ENABLED ? 'enabled' : 'disabled');
+  console.log('Farcaster posting cadence:', `every ${POST_EVERY_N_HOURS} hour(s)`);
+  console.log('Builder attribution:', TX_DATA_SUFFIX ? 'enabled' : 'disabled');
+  console.log('Agent stagger:', `${AGENT_RUN_STAGGER_MS}ms`);
   if (TX_DATA_SUFFIX) {
     const attributionSource = BUILDER_DATA_SUFFIX ? 'BUILDER_DATA_SUFFIX' : 'BUILDER_CODE(S)';
-    console.log('🔧 Attribution source:', attributionSource);
+    console.log('Attribution source:', attributionSource);
   }
   console.log('\n' + '='.repeat(50) + '\n');
 
-  // Check if running in test mode
   if (process.argv.includes('--once')) {
-    console.log('🧪 Running in test mode (one-time execution)');
-    await runAgent();
+    console.log('Running in test mode (one-time execution)');
+    await runAllAgents('run');
     process.exit(0);
   }
 
   if (process.argv.includes('--status')) {
-    await checkStatus();
+    await runAllAgents('status');
     process.exit(0);
   }
 
-  // Run immediately on start
-  await runAgent();
+  await runAllAgents('run');
 
-  // Schedule to run every hour at the top of the hour
   cron.schedule('0 * * * *', async () => {
-    await runAgent();
+    await runAllAgents('run');
   });
 
-  console.log('✅ Scheduler active. Agent will run every hour.');
-  console.log('⌨️  Press Ctrl+C to stop\n');
+  console.log('Scheduler active. Agents will run every hour.');
+  console.log('Press Ctrl+C to stop\n');
 }
-
 
 startAgent().catch(console.error);
