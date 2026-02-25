@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient, http, parseAbi } from 'viem';
+import { concatHex, createPublicClient, createWalletClient, http, numberToHex, parseAbi, stringToHex } from 'viem';
 import { base } from 'viem/chains';
 import { privateKeyToAccount } from 'viem/accounts';
 import cron from 'node-cron';
@@ -19,6 +19,14 @@ const RPC_MAX_RETRIES = Number(process.env.RPC_MAX_RETRIES || 5);
 const RPC_BASE_DELAY_MS = Number(process.env.RPC_BASE_DELAY_MS || 500);
 const RPC_MAX_DELAY_MS = Number(process.env.RPC_MAX_DELAY_MS || 8000);
 const RPC_JITTER_MS = Number(process.env.RPC_JITTER_MS || 200);
+const POST_EVERY_N_HOURS = Math.max(1, Number(process.env.POST_EVERY_N_HOURS || 1));
+const BUILDER_CODE = process.env.BUILDER_CODE?.trim();
+const BUILDER_CODES = (process.env.BUILDER_CODES || '')
+  .split(',')
+  .map(code => code.trim())
+  .filter(Boolean);
+const BUILDER_DATA_SUFFIX = process.env.BUILDER_DATA_SUFFIX?.trim();
+const ERC8021_DATA_SUFFIX = '0x80218021802180218021802180218021';
 
 // Contract ABI
 const CONTRACT_ABI = parseAbi([
@@ -34,6 +42,38 @@ const CONTRACT_ABI = parseAbi([
 ]);
 
 
+function buildErc8021DataSuffix(codes) {
+  const joinedCodes = codes.join(',');
+  const codesHex = stringToHex(joinedCodes);
+  const codesLength = (codesHex.length - 2) / 2;
+
+  if (codesLength > 255) {
+    throw new Error(`Builder codes are too long (${codesLength} bytes). Max is 255 bytes.`);
+  }
+
+  return concatHex([
+    codesHex,
+    numberToHex(codesLength, { size: 1 }),
+    numberToHex(0, { size: 1 }), // schema id 0
+    ERC8021_DATA_SUFFIX,
+  ]);
+}
+
+function resolveTxDataSuffix() {
+  if (BUILDER_DATA_SUFFIX) {
+    return BUILDER_DATA_SUFFIX;
+  }
+
+  const codes = BUILDER_CODES.length > 0 ? BUILDER_CODES : (BUILDER_CODE ? [BUILDER_CODE] : []);
+  if (codes.length === 0) {
+    return undefined;
+  }
+
+  return buildErc8021DataSuffix(codes);
+}
+
+const TX_DATA_SUFFIX = resolveTxDataSuffix();
+
 
 const account = privateKeyToAccount(`0x${PRIVATE_KEY.replace('0x', '')}`);
 
@@ -46,6 +86,7 @@ const walletClient = createWalletClient({
   account,
   chain: base,
   transport: http(BASE_RPC_URL_WRITE),
+  ...(TX_DATA_SUFFIX ? { dataSuffix: TX_DATA_SUFFIX } : {}),
 });
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -200,6 +241,7 @@ async function pressPowell() {
       address: CONTRACT_ADDRESS,
       abi: CONTRACT_ABI,
       functionName: 'press',
+      ...(TX_DATA_SUFFIX ? { dataSuffix: TX_DATA_SUFFIX } : {}),
     }),
     'simulatePress'
   );
@@ -323,14 +365,15 @@ async function runAgent() {
 
     
     const hour = new Date().getHours();
-    const shouldPost = hour % 6 === 0; 
+    const shouldPost = hour % POST_EVERY_N_HOURS === 0; 
     
     if (shouldPost) {
       const randomMessage = messages[Math.floor(Math.random() * messages.length)];
       await postToFarcaster(randomMessage);
     } else {
-      console.log('⏭️  Skipping Farcaster post (posting every 6 hours to avoid spam)');
-      console.log('📝 Next post scheduled for:', `${Math.ceil(hour / 6) * 6}:00`);
+      const nextPostingHour = Math.ceil((hour + 1) / POST_EVERY_N_HOURS) * POST_EVERY_N_HOURS;
+      console.log(`⏭️  Skipping Farcaster post (posting every ${POST_EVERY_N_HOURS} hour(s))`);
+      console.log('📝 Next post scheduled for:', `${nextPostingHour % 24}:00`);
     }
 
     console.log('\n✨ Agent run completed successfully!\n');
@@ -339,7 +382,7 @@ async function runAgent() {
     console.error('❌ Agent error:', error);
     
     
-    if (error.message.includes('cooldown')) {
+    if (String(error?.message || '').includes('cooldown')) {
       console.log('ℹ️  Cooldown error - this is normal, will try next hour');
     } else {
       await postToFarcaster(
@@ -382,6 +425,12 @@ async function startAgent() {
   console.log('⏰ Will run every hour on the hour');
   console.log('💼 Agent wallet:', account.address);
   console.log('📍 Contract:', CONTRACT_ADDRESS);
+  console.log('📰 Farcaster posting cadence:', `every ${POST_EVERY_N_HOURS} hour(s)`);
+  console.log('🏷️  Builder attribution:', TX_DATA_SUFFIX ? 'enabled' : 'disabled');
+  if (TX_DATA_SUFFIX) {
+    const attributionSource = BUILDER_DATA_SUFFIX ? 'BUILDER_DATA_SUFFIX' : 'BUILDER_CODE(S)';
+    console.log('🔧 Attribution source:', attributionSource);
+  }
   console.log('\n' + '='.repeat(50) + '\n');
 
   // Check if running in test mode

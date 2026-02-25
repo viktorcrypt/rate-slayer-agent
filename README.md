@@ -42,6 +42,15 @@ FARCASTER_SIGNER_UUID=your_signer_uuid
 CONTRACT_ADDRESS=0xeC6AF3c5934F383972bb9980A51EC976099270b8
 BASE_RPC_URL=https://mainnet.base.org
 APP_URL=https://rate-slayer.vercel.app
+
+# Optional: post cadence (default = every successful run)
+POST_EVERY_N_HOURS=1
+
+# Optional: Base Builder attribution (recommended for Base builder portal tracking)
+# Use one of:
+# 1) BUILDER_CODE=your_builder_code
+# 2) BUILDER_CODES=code_one,code_two
+# 3) BUILDER_DATA_SUFFIX=0x...   (precomputed ERC-8021 suffix)
 ```
 
 ### 3. Fund the agent wallet
@@ -96,6 +105,7 @@ If you want more control, you can use Farcaster's native APIs, but Neynar is muc
 - Includes stats (rate change, total presses)
 - Links to the app
 - Error handling with status updates
+- Posting cadence configurable via `POST_EVERY_N_HOURS`
 
 ### Monitoring
 - Logs all actions to console
