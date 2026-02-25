@@ -38,6 +38,9 @@ PRIVATE_KEY=your_private_key_here
 # AGENT_PRIVATE_KEYS=pk_agent_1,pk_agent_2,pk_agent_3
 # AGENT_NAMES=Slayer-1,Slayer-2,Slayer-3
 # AGENT_RUN_STAGGER_MS=3000
+# AGENT_RANDOM_SKIP_CHANCE=0.35
+# AGENT_ACTION_DELAY_MIN_MS=15000
+# AGENT_ACTION_DELAY_MAX_MS=180000
 
 # Get from https://neynar.com (free)
 NEYNAR_API_KEY=your_neynar_api_key
@@ -89,12 +92,16 @@ Use multiple wallets inside one process:
 AGENT_PRIVATE_KEYS=pk_agent_1,pk_agent_2,pk_agent_3
 AGENT_NAMES=Slayer-1,Slayer-2,Slayer-3
 AGENT_RUN_STAGGER_MS=3000
+AGENT_RANDOM_SKIP_CHANCE=0.35
+AGENT_ACTION_DELAY_MIN_MS=15000
+AGENT_ACTION_DELAY_MAX_MS=180000
 ```
 
 Notes:
 - `AGENT_PRIVATE_KEYS` takes precedence over `PRIVATE_KEY`
 - use unique private keys (duplicate keys behave like one wallet with different labels)
 - each wallet has its own cooldown in the contract
+- each cycle has random behavior: skip chance + random delay before press
 
 ## 🔧 How to get Farcaster credentials
 
@@ -120,6 +127,7 @@ If you want more control, you can use Farcaster's native APIs, but Neynar is muc
 - Checks cooldown before attempting to press
 - Reads current Fed rate from contract
 - Executes press transaction
+- Adds random skip/delay so agents do not act at exact same pattern
 - Posts result to Farcaster
 - Supports one or many agent wallets in one process
 

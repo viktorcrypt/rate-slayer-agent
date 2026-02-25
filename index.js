@@ -30,6 +30,15 @@ const RPC_BASE_DELAY_MS = Number(process.env.RPC_BASE_DELAY_MS || 500);
 const RPC_MAX_DELAY_MS = Number(process.env.RPC_MAX_DELAY_MS || 8000);
 const RPC_JITTER_MS = Number(process.env.RPC_JITTER_MS || 200);
 const POST_EVERY_N_HOURS = Math.max(1, Number(process.env.POST_EVERY_N_HOURS || 1));
+const AGENT_RANDOM_SKIP_CHANCE = Math.min(
+  0.95,
+  Math.max(0, Number(process.env.AGENT_RANDOM_SKIP_CHANCE || 0.35))
+);
+const AGENT_ACTION_DELAY_MIN_MS = Math.max(0, Number(process.env.AGENT_ACTION_DELAY_MIN_MS || 15000));
+const AGENT_ACTION_DELAY_MAX_MS = Math.max(
+  AGENT_ACTION_DELAY_MIN_MS,
+  Number(process.env.AGENT_ACTION_DELAY_MAX_MS || 180000)
+);
 const BUILDER_CODE = process.env.BUILDER_CODE?.trim();
 const BUILDER_CODES = (process.env.BUILDER_CODES || '')
   .split(',')
@@ -131,6 +140,13 @@ function createAgentContexts() {
 const agents = createAgentContexts();
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function randomInt(min, max) {
+  if (max <= min) {
+    return min;
+  }
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
 
 function isRateLimitError(error) {
   const status = error?.status || error?.cause?.status || error?.cause?.cause?.status;
@@ -320,8 +336,36 @@ async function runAgent(agent) {
       return;
     }
 
-    const rateBefore = preSnapshot.rate;
-    const pressesBefore = preSnapshot.presses;
+    const skipRoll = Math.random();
+    if (skipRoll < AGENT_RANDOM_SKIP_CHANCE) {
+      const rollPct = (skipRoll * 100).toFixed(1);
+      const thresholdPct = (AGENT_RANDOM_SKIP_CHANCE * 100).toFixed(1);
+      console.log(
+        `[${agent.name}] Random skip this cycle (roll ${rollPct}% < threshold ${thresholdPct}%)`
+      );
+      return;
+    }
+
+    const actionDelayMs = randomInt(AGENT_ACTION_DELAY_MIN_MS, AGENT_ACTION_DELAY_MAX_MS);
+    if (actionDelayMs > 0) {
+      console.log(`[${agent.name}] Random action delay: ${actionDelayMs}ms`);
+      await sleep(actionDelayMs);
+    }
+
+    const readySnapshot = await getPrePressSnapshot(
+      agent.account.address,
+      `prePressAfterDelay:${agent.name}`
+    );
+    const readyCooldown = readySnapshot.cooldown;
+    if (readyCooldown > 0) {
+      const minutes = Math.floor(readyCooldown / 60);
+      const seconds = readyCooldown % 60;
+      console.log(`[${agent.name}] Cooldown became active after delay: ${minutes}m ${seconds}s`);
+      return;
+    }
+
+    const rateBefore = readySnapshot.rate;
+    const pressesBefore = readySnapshot.presses;
 
     console.log(`[${agent.name}] Current Rate: ${rateBefore.toFixed(2)}%`);
     console.log(`[${agent.name}] Total Presses: ${pressesBefore}`);
@@ -432,6 +476,8 @@ async function startAgent() {
   console.log('Farcaster posting cadence:', `every ${POST_EVERY_N_HOURS} hour(s)`);
   console.log('Builder attribution:', TX_DATA_SUFFIX ? 'enabled' : 'disabled');
   console.log('Agent stagger:', `${AGENT_RUN_STAGGER_MS}ms`);
+  console.log('Random skip chance:', `${(AGENT_RANDOM_SKIP_CHANCE * 100).toFixed(1)}%`);
+  console.log('Random action delay range:', `${AGENT_ACTION_DELAY_MIN_MS}-${AGENT_ACTION_DELAY_MAX_MS}ms`);
   if (TX_DATA_SUFFIX) {
     const attributionSource = BUILDER_DATA_SUFFIX ? 'BUILDER_DATA_SUFFIX' : 'BUILDER_CODE(S)';
     console.log('Attribution source:', attributionSource);
