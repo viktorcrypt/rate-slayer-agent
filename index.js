@@ -29,7 +29,6 @@ const RPC_MAX_RETRIES = Number(process.env.RPC_MAX_RETRIES || 5);
 const RPC_BASE_DELAY_MS = Number(process.env.RPC_BASE_DELAY_MS || 500);
 const RPC_MAX_DELAY_MS = Number(process.env.RPC_MAX_DELAY_MS || 8000);
 const RPC_JITTER_MS = Number(process.env.RPC_JITTER_MS || 200);
-const POST_EVERY_N_HOURS = Math.max(1, Number(process.env.POST_EVERY_N_HOURS || 1));
 const AGENT_RANDOM_SKIP_CHANCE = Math.min(
   0.95,
   Math.max(0, Number(process.env.AGENT_RANDOM_SKIP_CHANCE || 0.35))
@@ -46,6 +45,8 @@ const BUILDER_CODES = (process.env.BUILDER_CODES || '')
   .filter(Boolean);
 const BUILDER_DATA_SUFFIX = process.env.BUILDER_DATA_SUFFIX?.trim();
 const ERC8021_DATA_SUFFIX = '0x80218021802180218021802180218021';
+const FARCASTER_MAX_SUCCESS_POSTS_PER_DAY = 1;
+const CAST_PERSONAS = ['Atlas', 'Rook', 'Mantis', 'Viper', 'Nova', 'Sentinel', 'Cipher', 'Falcon'];
 
 // Contract ABI
 const CONTRACT_ABI = parseAbi([
@@ -140,12 +141,42 @@ function createAgentContexts() {
 const agents = createAgentContexts();
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const farcasterPostState = {
+  dayKey: '',
+  successPostsToday: 0,
+};
 
 function randomInt(min, max) {
   if (max <= min) {
     return min;
   }
   return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function pickRandom(items) {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function getUtcDayKey(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
+function refreshFarcasterPostWindow(now = new Date()) {
+  const dayKey = getUtcDayKey(now);
+  if (farcasterPostState.dayKey !== dayKey) {
+    farcasterPostState.dayKey = dayKey;
+    farcasterPostState.successPostsToday = 0;
+  }
+}
+
+function canPostSuccessToFarcaster(now = new Date()) {
+  refreshFarcasterPostWindow(now);
+  return farcasterPostState.successPostsToday < FARCASTER_MAX_SUCCESS_POSTS_PER_DAY;
+}
+
+function markSuccessPostToFarcaster(now = new Date()) {
+  refreshFarcasterPostWindow(now);
+  farcasterPostState.successPostsToday += 1;
 }
 
 function isRateLimitError(error) {
@@ -381,24 +412,23 @@ async function runAgent(agent) {
     console.log(`\n[${agent.name}] New Rate: ${rateAfter.toFixed(2)}%`);
     console.log(`[${agent.name}] Total Presses: ${pressesAfter}`);
 
+    const castPersona = pickRandom(CAST_PERSONAS);
     const messages = [
-      `[${agent.name}] AUTO-HIT #${pressesAfter}\n\nFed Rate: ${rateBefore.toFixed(2)}% -> ${rateAfter.toFixed(2)}%\n\n${APP_URL}`,
-      `[${agent.name}] Just pressed Powell\n\nRate: ${rateAfter.toFixed(2)}%\nTotal hits: ${pressesAfter}\n\n${APP_URL}`,
-      `[${agent.name}] Hit complete\n\nFed Rate: ${rateBefore.toFixed(2)}% -> ${rateAfter.toFixed(2)}%\n\n${APP_URL}`,
+      `Agent ${castPersona} landed a hit.\n\nFed Rate: ${rateBefore.toFixed(2)}% -> ${rateAfter.toFixed(2)}%\nTotal hits: ${pressesAfter}\n\n${APP_URL}`,
+      `${castPersona} reports mission success.\n\nRate now: ${rateAfter.toFixed(2)}%\nPress count: ${pressesAfter}\n\n${APP_URL}`,
+      `${castPersona} executed press().\n\nFed Rate: ${rateBefore.toFixed(2)}% -> ${rateAfter.toFixed(2)}%\nHit #${pressesAfter}\n\n${APP_URL}`,
     ];
 
-    const hour = new Date().getHours();
-    const shouldPost = FARCASTER_POSTS_ENABLED && hour % POST_EVERY_N_HOURS === 0;
-
-    if (shouldPost) {
-      const randomMessage = messages[Math.floor(Math.random() * messages.length)];
-      await postToFarcaster(randomMessage);
-    } else if (!FARCASTER_POSTS_ENABLED) {
+    if (!FARCASTER_POSTS_ENABLED) {
       console.log('Skipping Farcaster post (disabled)');
+    } else if (!canPostSuccessToFarcaster()) {
+      console.log('Skipping Farcaster post (daily success post limit reached)');
     } else {
-      const nextPostingHour = Math.ceil((hour + 1) / POST_EVERY_N_HOURS) * POST_EVERY_N_HOURS;
-      console.log(`Skipping Farcaster post (posting every ${POST_EVERY_N_HOURS} hour(s))`);
-      console.log('Next post scheduled for:', `${nextPostingHour % 24}:00`);
+      const randomMessage = messages[Math.floor(Math.random() * messages.length)];
+      const postResult = await postToFarcaster(randomMessage);
+      if (postResult) {
+        markSuccessPostToFarcaster();
+      }
     }
 
     console.log(`\n[${agent.name}] Agent run completed successfully!\n`);
@@ -407,12 +437,8 @@ async function runAgent(agent) {
 
     if (String(error?.message || '').includes('cooldown')) {
       console.log('Cooldown error - this is normal, will try next hour');
-    } else if (FARCASTER_POSTS_ENABLED) {
-      await postToFarcaster(
-        `[${agent.name}] Rate Slayer Bot encountered an issue\n\nStatus: Investigating\nWill retry next hour\n\n${APP_URL}`
-      );
     } else {
-      console.log('Skipping Farcaster error post (disabled)');
+      console.log('Skipping Farcaster error post (success-only mode)');
     }
   }
 }
@@ -473,7 +499,8 @@ async function startAgent() {
   }
   console.log('Contract:', CONTRACT_ADDRESS);
   console.log('Farcaster posting:', FARCASTER_POSTS_ENABLED ? 'enabled' : 'disabled');
-  console.log('Farcaster posting cadence:', `every ${POST_EVERY_N_HOURS} hour(s)`);
+  console.log('Farcaster posting mode:', 'success-only');
+  console.log('Farcaster success post limit:', `${FARCASTER_MAX_SUCCESS_POSTS_PER_DAY} per UTC day`);
   console.log('Builder attribution:', TX_DATA_SUFFIX ? 'enabled' : 'disabled');
   console.log('Agent stagger:', `${AGENT_RUN_STAGGER_MS}ms`);
   console.log('Random skip chance:', `${(AGENT_RANDOM_SKIP_CHANCE * 100).toFixed(1)}%`);
