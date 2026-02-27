@@ -1,4 +1,4 @@
-import { concatHex, createPublicClient, createWalletClient, http, numberToHex, parseAbi, stringToHex } from 'viem';
+import { concatHex, createPublicClient, createWalletClient, formatEther, http, numberToHex, parseAbi, parseEther, stringToHex } from 'viem';
 import { base } from 'viem/chains';
 import { privateKeyToAccount } from 'viem/accounts';
 import cron from 'node-cron';
@@ -38,6 +38,7 @@ const AGENT_ACTION_DELAY_MAX_MS = Math.max(
   AGENT_ACTION_DELAY_MIN_MS,
   Number(process.env.AGENT_ACTION_DELAY_MAX_MS || 180000)
 );
+const AGENT_MIN_BALANCE_ETH = process.env.AGENT_MIN_BALANCE_ETH || '0.000001';
 const BUILDER_CODE = process.env.BUILDER_CODE?.trim();
 const BUILDER_CODES = (process.env.BUILDER_CODES || '')
   .split(',')
@@ -47,6 +48,12 @@ const BUILDER_DATA_SUFFIX = process.env.BUILDER_DATA_SUFFIX?.trim();
 const ERC8021_DATA_SUFFIX = '0x80218021802180218021802180218021';
 const FARCASTER_MAX_SUCCESS_POSTS_PER_DAY = 1;
 const CAST_PERSONAS = ['Atlas', 'Rook', 'Mantis', 'Viper', 'Nova', 'Sentinel', 'Cipher', 'Falcon'];
+let AGENT_MIN_BALANCE_WEI;
+try {
+  AGENT_MIN_BALANCE_WEI = parseEther(AGENT_MIN_BALANCE_ETH);
+} catch {
+  throw new Error(`Invalid AGENT_MIN_BALANCE_ETH value: "${AGENT_MIN_BALANCE_ETH}"`);
+}
 
 // Contract ABI
 const CONTRACT_ABI = parseAbi([
@@ -198,6 +205,29 @@ function isRateLimitError(error) {
   );
 }
 
+function isInsufficientFundsError(error) {
+  const message = [
+    error?.message,
+    error?.shortMessage,
+    error?.details,
+    error?.cause?.message,
+    error?.cause?.shortMessage,
+    error?.cause?.details,
+    error?.cause?.cause?.message,
+    error?.cause?.cause?.shortMessage,
+    error?.cause?.cause?.details,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  return (
+    message.includes('insufficient funds') ||
+    message.includes('exceeds balance') ||
+    message.includes('exceeds the balance')
+  );
+}
+
 async function withRpcRetry(fn, label) {
   let attempt = 0;
 
@@ -220,6 +250,13 @@ async function withRpcRetry(fn, label) {
       await sleep(waitMs);
     }
   }
+}
+
+async function getAgentBalanceWei(address, label = 'agentBalance') {
+  return await withRpcRetry(
+    () => publicClient.getBalance({ address }),
+    label
+  );
 }
 
 
@@ -357,6 +394,14 @@ async function runAgent(agent) {
     console.log('Agent Address:', agent.account.address);
     console.log('='.repeat(50) + '\n');
 
+    const balanceWei = await getAgentBalanceWei(agent.account.address, `balance:${agent.name}`);
+    if (balanceWei < AGENT_MIN_BALANCE_WEI) {
+      console.log(
+        `[${agent.name}] Low ETH balance: ${formatEther(balanceWei)} ETH (min ${AGENT_MIN_BALANCE_ETH} ETH). Skipping run.`
+      );
+      return;
+    }
+
     const preSnapshot = await getPrePressSnapshot(agent.account.address, `prePressSnapshot:${agent.name}`);
     const cooldown = preSnapshot.cooldown;
     if (cooldown > 0) {
@@ -435,7 +480,9 @@ async function runAgent(agent) {
   } catch (error) {
     console.error(`[${agent.name}] Agent error:`, error);
 
-    if (String(error?.message || '').includes('cooldown')) {
+    if (isInsufficientFundsError(error)) {
+      console.log(`[${agent.name}] Insufficient ETH for gas. Top up this wallet to resume actions.`);
+    } else if (String(error?.message || '').includes('cooldown')) {
       console.log('Cooldown error - this is normal, will try next hour');
     } else {
       console.log('Skipping Farcaster error post (success-only mode)');
@@ -472,10 +519,14 @@ async function runAllAgents(mode) {
   for (let i = 0; i < agents.length; i++) {
     const agent = agents[i];
 
-    if (mode === 'status') {
-      await checkStatus(agent);
-    } else {
-      await runAgent(agent);
+    try {
+      if (mode === 'status') {
+        await checkStatus(agent);
+      } else {
+        await runAgent(agent);
+      }
+    } catch (error) {
+      console.error(`[${agent.name}] Unhandled loop error:`, error);
     }
 
     const shouldWait = i < agents.length - 1 && AGENT_RUN_STAGGER_MS > 0;
@@ -505,6 +556,7 @@ async function startAgent() {
   console.log('Agent stagger:', `${AGENT_RUN_STAGGER_MS}ms`);
   console.log('Random skip chance:', `${(AGENT_RANDOM_SKIP_CHANCE * 100).toFixed(1)}%`);
   console.log('Random action delay range:', `${AGENT_ACTION_DELAY_MIN_MS}-${AGENT_ACTION_DELAY_MAX_MS}ms`);
+  console.log('Min agent gas balance:', `${AGENT_MIN_BALANCE_ETH} ETH`);
   if (TX_DATA_SUFFIX) {
     const attributionSource = BUILDER_DATA_SUFFIX ? 'BUILDER_DATA_SUFFIX' : 'BUILDER_CODE(S)';
     console.log('Attribution source:', attributionSource);
