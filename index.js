@@ -4,6 +4,8 @@ import { privateKeyToAccount } from 'viem/accounts';
 import cron from 'node-cron';
 import dotenv from 'dotenv';
 import axios from 'axios';
+import fs from 'node:fs';
+import path from 'node:path';
 
 dotenv.config();
 
@@ -39,6 +41,21 @@ const AGENT_ACTION_DELAY_MAX_MS = Math.max(
   Number(process.env.AGENT_ACTION_DELAY_MAX_MS || 180000)
 );
 const AGENT_MIN_BALANCE_ETH = process.env.AGENT_MIN_BALANCE_ETH || '0.000001';
+const AGENT_NEW_ACTION_CHANCE = Math.min(
+  1,
+  Math.max(0, Number(process.env.AGENT_NEW_ACTION_CHANCE || 0.9))
+);
+const AGENT_ACTION_CHANCE_DAILY_DECAY = Math.min(
+  1,
+  Math.max(0.9, Number(process.env.AGENT_ACTION_CHANCE_DAILY_DECAY || 0.985))
+);
+const AGENT_MIN_ACTION_CHANCE = Math.min(
+  1,
+  Math.max(0, Number(process.env.AGENT_MIN_ACTION_CHANCE || 0.2))
+);
+const AGENT_CYCLE_MAX_TRANSACTIONS = Math.max(1, Number(process.env.AGENT_CYCLE_MAX_TRANSACTIONS || 2));
+const RUN_ON_START = String(process.env.RUN_ON_START || 'false').toLowerCase() === 'true';
+const AGENT_STATE_FILE = process.env.AGENT_STATE_FILE || '.agent-state.json';
 const BUILDER_CODE = process.env.BUILDER_CODE?.trim();
 const BUILDER_CODES = (process.env.BUILDER_CODES || '')
   .split(',')
@@ -48,12 +65,14 @@ const BUILDER_DATA_SUFFIX = process.env.BUILDER_DATA_SUFFIX?.trim();
 const ERC8021_DATA_SUFFIX = '0x80218021802180218021802180218021';
 const FARCASTER_MAX_SUCCESS_POSTS_PER_DAY = 1;
 const CAST_PERSONAS = ['Atlas', 'Rook', 'Mantis', 'Viper', 'Nova', 'Sentinel', 'Cipher', 'Falcon'];
+const DAY_MS = 24 * 60 * 60 * 1000;
 let AGENT_MIN_BALANCE_WEI;
 try {
   AGENT_MIN_BALANCE_WEI = parseEther(AGENT_MIN_BALANCE_ETH);
 } catch {
   throw new Error(`Invalid AGENT_MIN_BALANCE_ETH value: "${AGENT_MIN_BALANCE_ETH}"`);
 }
+const AGENT_STATE_FILE_PATH = path.resolve(process.cwd(), AGENT_STATE_FILE);
 
 // Contract ABI
 const CONTRACT_ABI = parseAbi([
@@ -146,6 +165,7 @@ function createAgentContexts() {
 }
 
 const agents = createAgentContexts();
+const agentBehaviorState = loadAgentBehaviorState();
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const farcasterPostState = {
@@ -162,6 +182,114 @@ function randomInt(min, max) {
 
 function pickRandom(items) {
   return items[Math.floor(Math.random() * items.length)];
+}
+
+function normalizeAddress(address) {
+  return address.toLowerCase();
+}
+
+function shuffleArray(items) {
+  const copy = [...items];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
+function loadAgentBehaviorState() {
+  try {
+    if (!fs.existsSync(AGENT_STATE_FILE_PATH)) {
+      return { agents: {} };
+    }
+
+    const raw = fs.readFileSync(AGENT_STATE_FILE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || typeof parsed.agents !== 'object') {
+      return { agents: {} };
+    }
+    return parsed;
+  } catch (error) {
+    console.warn(`Failed to read ${AGENT_STATE_FILE_PATH}, starting with empty state:`, error.message);
+    return { agents: {} };
+  }
+}
+
+function saveAgentBehaviorState() {
+  try {
+    fs.mkdirSync(path.dirname(AGENT_STATE_FILE_PATH), { recursive: true });
+    fs.writeFileSync(AGENT_STATE_FILE_PATH, JSON.stringify(agentBehaviorState, null, 2));
+  } catch (error) {
+    console.warn(`Failed to save ${AGENT_STATE_FILE_PATH}:`, error.message);
+  }
+}
+
+function ensureAgentTracked(agent, now = Date.now()) {
+  const key = normalizeAddress(agent.account.address);
+  if (!agentBehaviorState.agents[key]) {
+    agentBehaviorState.agents[key] = {
+      name: agent.name,
+      firstSeenAt: new Date(now).toISOString(),
+      successfulPresses: 0,
+      lastSuccessAt: null,
+    };
+    saveAgentBehaviorState();
+  } else if (agentBehaviorState.agents[key].name !== agent.name) {
+    agentBehaviorState.agents[key].name = agent.name;
+    saveAgentBehaviorState();
+  }
+
+  return agentBehaviorState.agents[key];
+}
+
+function ensureAllAgentsTracked(now = Date.now()) {
+  let changed = false;
+  for (const agent of agents) {
+    const key = normalizeAddress(agent.account.address);
+    if (!agentBehaviorState.agents[key]) {
+      agentBehaviorState.agents[key] = {
+        name: agent.name,
+        firstSeenAt: new Date(now).toISOString(),
+        successfulPresses: 0,
+        lastSuccessAt: null,
+      };
+      changed = true;
+    } else if (agentBehaviorState.agents[key].name !== agent.name) {
+      agentBehaviorState.agents[key].name = agent.name;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    saveAgentBehaviorState();
+  }
+}
+
+function getAgentAgeDays(firstSeenAt, now = Date.now()) {
+  const firstSeenMs = Date.parse(firstSeenAt || '');
+  if (!Number.isFinite(firstSeenMs)) {
+    return 0;
+  }
+  return Math.max(0, Math.floor((now - firstSeenMs) / DAY_MS));
+}
+
+function getAgentActionChance(agent, now = Date.now()) {
+  const state = ensureAgentTracked(agent, now);
+  const ageDays = getAgentAgeDays(state.firstSeenAt, now);
+  const decayedChance = AGENT_NEW_ACTION_CHANCE * (AGENT_ACTION_CHANCE_DAILY_DECAY ** ageDays);
+  const actionChance = Math.max(AGENT_MIN_ACTION_CHANCE, Math.min(1, decayedChance));
+
+  return {
+    ageDays,
+    actionChance,
+  };
+}
+
+function markAgentPressSuccess(agent, now = Date.now()) {
+  const state = ensureAgentTracked(agent, now);
+  state.successfulPresses = Number(state.successfulPresses || 0) + 1;
+  state.lastSuccessAt = new Date(now).toISOString();
+  saveAgentBehaviorState();
 }
 
 function getUtcDayKey(date = new Date()) {
@@ -386,13 +514,20 @@ async function postToFarcaster(text) {
 }
 
 
-async function runAgent(agent) {
+async function runAgent(agent, cycleContext = null) {
   try {
     console.log('\n' + '='.repeat(50));
     console.log(`${agent.name} running...`);
     console.log('Time:', new Date().toLocaleString());
     console.log('Agent Address:', agent.account.address);
     console.log('='.repeat(50) + '\n');
+
+    if (cycleContext && cycleContext.sentTransactions >= cycleContext.maxTransactions) {
+      console.log(
+        `[${agent.name}] Cycle tx budget reached (${cycleContext.sentTransactions}/${cycleContext.maxTransactions}), skipping.`
+      );
+      return;
+    }
 
     const balanceWei = await getAgentBalanceWei(agent.account.address, `balance:${agent.name}`);
     if (balanceWei < AGENT_MIN_BALANCE_WEI) {
@@ -422,6 +557,17 @@ async function runAgent(agent) {
       return;
     }
 
+    const { ageDays, actionChance } = getAgentActionChance(agent);
+    const ageRoll = Math.random();
+    if (ageRoll > actionChance) {
+      const rollPct = (ageRoll * 100).toFixed(1);
+      const chancePct = (actionChance * 100).toFixed(1);
+      console.log(
+        `[${agent.name}] Age-weighted skip (age ${ageDays}d, roll ${rollPct}% > chance ${chancePct}%).`
+      );
+      return;
+    }
+
     const actionDelayMs = randomInt(AGENT_ACTION_DELAY_MIN_MS, AGENT_ACTION_DELAY_MAX_MS);
     if (actionDelayMs > 0) {
       console.log(`[${agent.name}] Random action delay: ${actionDelayMs}ms`);
@@ -447,6 +593,13 @@ async function runAgent(agent) {
     console.log(`[${agent.name}] Total Presses: ${pressesBefore}`);
 
     await pressPowell(agent);
+    markAgentPressSuccess(agent);
+    if (cycleContext) {
+      cycleContext.sentTransactions += 1;
+      console.log(
+        `[${agent.name}] Cycle tx usage: ${cycleContext.sentTransactions}/${cycleContext.maxTransactions}`
+      );
+    }
 
     await sleep(5000);
 
@@ -516,14 +669,33 @@ async function checkStatus(agent) {
 }
 
 async function runAllAgents(mode) {
-  for (let i = 0; i < agents.length; i++) {
-    const agent = agents[i];
+  const runQueue = mode === 'run' ? shuffleArray(agents) : agents;
+  const cycleContext = mode === 'run'
+    ? {
+      sentTransactions: 0,
+      maxTransactions: AGENT_CYCLE_MAX_TRANSACTIONS,
+    }
+    : null;
+
+  if (mode === 'run') {
+    console.log(`Run cycle tx budget: ${cycleContext.maxTransactions} tx max`);
+  }
+
+  for (let i = 0; i < runQueue.length; i++) {
+    const agent = runQueue[i];
+
+    if (mode === 'run' && cycleContext.sentTransactions >= cycleContext.maxTransactions) {
+      console.log(
+        `Cycle tx budget reached (${cycleContext.sentTransactions}/${cycleContext.maxTransactions}). Ending this cycle early.`
+      );
+      break;
+    }
 
     try {
       if (mode === 'status') {
         await checkStatus(agent);
       } else {
-        await runAgent(agent);
+        await runAgent(agent, cycleContext);
       }
     } catch (error) {
       console.error(`[${agent.name}] Unhandled loop error:`, error);
@@ -538,6 +710,7 @@ async function runAllAgents(mode) {
 }
 
 async function startAgent() {
+  ensureAllAgentsTracked();
   console.log('\nRate Slayer Agent Started!\n');
   console.log('Will run every hour on the hour');
   console.log('Agents configured:', agents.length);
@@ -555,8 +728,14 @@ async function startAgent() {
   console.log('Builder attribution:', TX_DATA_SUFFIX ? 'enabled' : 'disabled');
   console.log('Agent stagger:', `${AGENT_RUN_STAGGER_MS}ms`);
   console.log('Random skip chance:', `${(AGENT_RANDOM_SKIP_CHANCE * 100).toFixed(1)}%`);
+  console.log('New agent action chance:', `${(AGENT_NEW_ACTION_CHANCE * 100).toFixed(1)}%`);
+  console.log('Daily action chance decay:', `${(AGENT_ACTION_CHANCE_DAILY_DECAY * 100).toFixed(2)}%`);
+  console.log('Min action chance floor:', `${(AGENT_MIN_ACTION_CHANCE * 100).toFixed(1)}%`);
   console.log('Random action delay range:', `${AGENT_ACTION_DELAY_MIN_MS}-${AGENT_ACTION_DELAY_MAX_MS}ms`);
+  console.log('Cycle transaction budget:', `${AGENT_CYCLE_MAX_TRANSACTIONS} tx`);
   console.log('Min agent gas balance:', `${AGENT_MIN_BALANCE_ETH} ETH`);
+  console.log('Run immediately on startup:', RUN_ON_START ? 'enabled' : 'disabled');
+  console.log('Agent behavior state file:', AGENT_STATE_FILE_PATH);
   if (TX_DATA_SUFFIX) {
     const attributionSource = BUILDER_DATA_SUFFIX ? 'BUILDER_DATA_SUFFIX' : 'BUILDER_CODE(S)';
     console.log('Attribution source:', attributionSource);
@@ -574,7 +753,11 @@ async function startAgent() {
     process.exit(0);
   }
 
-  await runAllAgents('run');
+  if (RUN_ON_START) {
+    await runAllAgents('run');
+  } else {
+    console.log('Startup run skipped. Waiting for next scheduled cycle.');
+  }
 
   cron.schedule('0 * * * *', async () => {
     await runAllAgents('run');
