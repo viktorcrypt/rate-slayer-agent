@@ -54,6 +54,9 @@ const AGENT_MIN_ACTION_CHANCE = Math.min(
   Math.max(0, Number(process.env.AGENT_MIN_ACTION_CHANCE || 0.2))
 );
 const AGENT_CYCLE_MAX_TRANSACTIONS = Math.max(1, Number(process.env.AGENT_CYCLE_MAX_TRANSACTIONS || 2));
+const AGENT_DAILY_TX_MIN = Math.max(1, Number(process.env.AGENT_DAILY_TX_MIN || 15));
+const AGENT_DAILY_TX_MAX = Math.max(AGENT_DAILY_TX_MIN, Number(process.env.AGENT_DAILY_TX_MAX || 20));
+const AGENT_NEW_PRIORITY_DAYS = Math.max(0, Number(process.env.AGENT_NEW_PRIORITY_DAYS || 7));
 const RUN_ON_START = String(process.env.RUN_ON_START || 'false').toLowerCase() === 'true';
 const AGENT_STATE_FILE = process.env.AGENT_STATE_FILE || '.agent-state.json';
 const BUILDER_CODE = process.env.BUILDER_CODE?.trim();
@@ -188,30 +191,101 @@ function normalizeAddress(address) {
   return address.toLowerCase();
 }
 
-function shuffleArray(items) {
-  const copy = [...items];
-  for (let i = copy.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [copy[i], copy[j]] = [copy[j], copy[i]];
+function pickDailyTxTarget() {
+  return randomInt(AGENT_DAILY_TX_MIN, AGENT_DAILY_TX_MAX);
+}
+
+function refreshDailyTxBudget(now = new Date()) {
+  const dayKey = getUtcDayKey(now);
+  const budget = agentBehaviorState.dailyBudget;
+
+  if (!budget || budget.dayKey !== dayKey) {
+    agentBehaviorState.dailyBudget = {
+      dayKey,
+      targetTransactions: pickDailyTxTarget(),
+      sentTransactions: 0,
+    };
+    saveAgentBehaviorState();
+  } else {
+    const normalizedTarget = Math.max(
+      AGENT_DAILY_TX_MIN,
+      Math.min(AGENT_DAILY_TX_MAX, Number(budget.targetTransactions || 0))
+    );
+    const normalizedSent = Math.max(0, Number(budget.sentTransactions || 0));
+    if (
+      normalizedTarget !== budget.targetTransactions ||
+      normalizedSent !== budget.sentTransactions
+    ) {
+      budget.targetTransactions = normalizedTarget;
+      budget.sentTransactions = normalizedSent;
+      saveAgentBehaviorState();
+    }
   }
-  return copy;
+
+  return agentBehaviorState.dailyBudget;
+}
+
+function getDailyTxRemaining(now = new Date()) {
+  const budget = refreshDailyTxBudget(now);
+  return Math.max(0, budget.targetTransactions - budget.sentTransactions);
+}
+
+function recordDailyTxSuccess(now = new Date()) {
+  const budget = refreshDailyTxBudget(now);
+  budget.sentTransactions = Math.min(
+    budget.targetTransactions,
+    Number(budget.sentTransactions || 0) + 1
+  );
+  saveAgentBehaviorState();
+  return budget;
+}
+
+function getAgentPriorityBucket(agent, now = Date.now()) {
+  const state = ensureAgentTracked(agent, now);
+  const ageDays = getAgentAgeDays(state.firstSeenAt, now);
+  const isPriority = ageDays <= AGENT_NEW_PRIORITY_DAYS;
+  return {
+    agent,
+    ageDays,
+    isPriority,
+    tieBreak: Math.random(),
+  };
+}
+
+function buildRunQueueByPriority(now = Date.now()) {
+  const entries = agents.map(agent => getAgentPriorityBucket(agent, now));
+
+  entries.sort((a, b) => {
+    if (a.isPriority !== b.isPriority) {
+      return a.isPriority ? -1 : 1;
+    }
+    if (a.ageDays !== b.ageDays) {
+      return a.ageDays - b.ageDays;
+    }
+    return a.tieBreak - b.tieBreak;
+  });
+
+  return entries.map(entry => entry.agent);
 }
 
 function loadAgentBehaviorState() {
   try {
     if (!fs.existsSync(AGENT_STATE_FILE_PATH)) {
-      return { agents: {} };
+      return { agents: {}, dailyBudget: null };
     }
 
     const raw = fs.readFileSync(AGENT_STATE_FILE_PATH, 'utf8');
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || typeof parsed.agents !== 'object') {
-      return { agents: {} };
+      return { agents: {}, dailyBudget: null };
+    }
+    if (!parsed.dailyBudget || typeof parsed.dailyBudget !== 'object') {
+      parsed.dailyBudget = null;
     }
     return parsed;
   } catch (error) {
     console.warn(`Failed to read ${AGENT_STATE_FILE_PATH}, starting with empty state:`, error.message);
-    return { agents: {} };
+    return { agents: {}, dailyBudget: null };
   }
 }
 
@@ -595,10 +669,16 @@ async function runAgent(agent, cycleContext = null) {
     await pressPowell(agent);
     markAgentPressSuccess(agent);
     if (cycleContext) {
+      const dailyBudget = recordDailyTxSuccess();
       cycleContext.sentTransactions += 1;
       console.log(
         `[${agent.name}] Cycle tx usage: ${cycleContext.sentTransactions}/${cycleContext.maxTransactions}`
       );
+      console.log(
+        `[${agent.name}] Daily tx usage: ${dailyBudget.sentTransactions}/${dailyBudget.targetTransactions} (${dailyBudget.dayKey})`
+      );
+    } else {
+      recordDailyTxSuccess();
     }
 
     await sleep(5000);
@@ -669,16 +749,25 @@ async function checkStatus(agent) {
 }
 
 async function runAllAgents(mode) {
-  const runQueue = mode === 'run' ? shuffleArray(agents) : agents;
+  const runQueue = mode === 'run' ? buildRunQueueByPriority() : agents;
   const cycleContext = mode === 'run'
     ? {
       sentTransactions: 0,
-      maxTransactions: AGENT_CYCLE_MAX_TRANSACTIONS,
+      maxTransactions: Math.min(AGENT_CYCLE_MAX_TRANSACTIONS, getDailyTxRemaining()),
     }
     : null;
 
   if (mode === 'run') {
+    const dailyBudget = refreshDailyTxBudget();
+    const dailyRemaining = Math.max(0, dailyBudget.targetTransactions - dailyBudget.sentTransactions);
+    console.log(
+      `Daily tx budget: ${dailyBudget.sentTransactions}/${dailyBudget.targetTransactions} used (${dailyBudget.dayKey}), remaining ${dailyRemaining}`
+    );
     console.log(`Run cycle tx budget: ${cycleContext.maxTransactions} tx max`);
+    if (cycleContext.maxTransactions <= 0) {
+      console.log('Daily tx cap reached. Skipping this cycle.');
+      return;
+    }
   }
 
   for (let i = 0; i < runQueue.length; i++) {
@@ -701,7 +790,7 @@ async function runAllAgents(mode) {
       console.error(`[${agent.name}] Unhandled loop error:`, error);
     }
 
-    const shouldWait = i < agents.length - 1 && AGENT_RUN_STAGGER_MS > 0;
+    const shouldWait = i < runQueue.length - 1 && AGENT_RUN_STAGGER_MS > 0;
     if (shouldWait) {
       console.log(`Waiting ${AGENT_RUN_STAGGER_MS}ms before next agent...`);
       await sleep(AGENT_RUN_STAGGER_MS);
@@ -733,9 +822,16 @@ async function startAgent() {
   console.log('Min action chance floor:', `${(AGENT_MIN_ACTION_CHANCE * 100).toFixed(1)}%`);
   console.log('Random action delay range:', `${AGENT_ACTION_DELAY_MIN_MS}-${AGENT_ACTION_DELAY_MAX_MS}ms`);
   console.log('Cycle transaction budget:', `${AGENT_CYCLE_MAX_TRANSACTIONS} tx`);
+  console.log('Daily transaction target range:', `${AGENT_DAILY_TX_MIN}-${AGENT_DAILY_TX_MAX} tx`);
+  console.log('New agent priority window:', `${AGENT_NEW_PRIORITY_DAYS} day(s)`);
   console.log('Min agent gas balance:', `${AGENT_MIN_BALANCE_ETH} ETH`);
   console.log('Run immediately on startup:', RUN_ON_START ? 'enabled' : 'disabled');
   console.log('Agent behavior state file:', AGENT_STATE_FILE_PATH);
+  const dailyBudget = refreshDailyTxBudget();
+  console.log(
+    'Daily tx budget state:',
+    `${dailyBudget.sentTransactions}/${dailyBudget.targetTransactions} (${dailyBudget.dayKey})`
+  );
   if (TX_DATA_SUFFIX) {
     const attributionSource = BUILDER_DATA_SUFFIX ? 'BUILDER_DATA_SUFFIX' : 'BUILDER_CODE(S)';
     console.log('Attribution source:', attributionSource);
