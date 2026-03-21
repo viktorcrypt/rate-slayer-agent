@@ -83,6 +83,31 @@ const farcasterPostState = {
 };
 let runtimeTaskChain = Promise.resolve();
 const pendingGameActivations = new Set();
+const inactiveGameIds = new Set();
+
+function normalizeGameId(gameOrId) {
+  return String(gameOrId?.id || gameOrId || '').trim();
+}
+
+function isGameInactive(gameOrId) {
+  const gameId = normalizeGameId(gameOrId);
+  return gameId ? inactiveGameIds.has(gameId) : false;
+}
+
+function markGameInactive(gameOrId) {
+  const gameId = normalizeGameId(gameOrId);
+  if (gameId) {
+    inactiveGameIds.add(gameId);
+    pendingGameActivations.delete(gameId);
+  }
+}
+
+function markGameActive(gameOrId) {
+  const gameId = normalizeGameId(gameOrId);
+  if (gameId) {
+    inactiveGameIds.delete(gameId);
+  }
+}
 
 function randomInt(min, max) {
   if (max <= min) {
@@ -158,6 +183,8 @@ function scheduleGameActivation(game, reason = 'game-created') {
     };
   }
 
+  markGameActive(activationKey);
+
   if (pendingGameActivations.has(activationKey)) {
     return {
       status: 'already-queued',
@@ -170,7 +197,17 @@ function scheduleGameActivation(game, reason = 'game-created') {
 
   void enqueueRuntimeTask(`activate:${game.name}:${reason}`, async () => {
     try {
+      if (isGameInactive(activationKey)) {
+        console.log(`[runtime] Activation cancelled for ${game.name} (${reason}) because the game is inactive.`);
+        return;
+      }
+
       await ensureAgentsRegisteredOnchain([game]);
+      if (isGameInactive(activationKey)) {
+        console.log(`[runtime] Activation run skipped for ${game.name} because the game is inactive.`);
+        return;
+      }
+
       await runGames([game], 'run');
     } catch (error) {
       console.error(`[runtime] Activation failed for ${game.name}:`, error);
@@ -306,6 +343,11 @@ async function showStatus(agent, game) {
 
 async function runAgentForGame(agent, game, cycleContext = null) {
   try {
+    if (isGameInactive(game.id)) {
+      console.log(`[${agent.name}] ${game.name} is inactive. Skipping run.`);
+      return;
+    }
+
     console.log('\n' + '='.repeat(50));
     console.log(`${agent.name} running for ${game.name}...`);
     console.log('Time:', new Date().toLocaleString());
@@ -355,6 +397,11 @@ async function runAgentForGame(agent, game, cycleContext = null) {
     if (actionDelayMs > 0) {
       console.log(`[${agent.name}] Random action delay for ${game.name}: ${actionDelayMs}ms`);
       await sleep(actionDelayMs);
+    }
+
+    if (isGameInactive(game.id)) {
+      console.log(`[${agent.name}] ${game.name} was stopped during delay. Aborting run.`);
+      return;
     }
 
     const readySnapshot = await getPrePressSnapshot(
@@ -447,6 +494,11 @@ async function runAgentForGame(agent, game, cycleContext = null) {
     const decision = await askLLM(llmContext);
     console.log('[brain]', game.name, decision.action, '-', decision.reason);
     await saveDecision(game.id, agent.account.address, decision);
+
+    if (isGameInactive(game.id)) {
+      console.log(`[${agent.name}] ${game.name} was stopped before tx submission. Aborting run.`);
+      return;
+    }
 
     if (decision.action === 'skip') {
       console.log(`[${agent.name}] Skipping ${game.name} per brain decision.`);
@@ -617,6 +669,11 @@ async function runGames(games, mode) {
   }
 
   for (const game of games) {
+    if (isGameInactive(game.id)) {
+      console.log(`${game.name} is inactive. Skipping game loop.`);
+      continue;
+    }
+
     if (mode === 'run' && cycleContext.sentTransactions >= cycleContext.maxTransactions) {
       console.log(
         `Cycle tx budget reached (${cycleContext.sentTransactions}/${cycleContext.maxTransactions}). Ending this cycle early.`
@@ -626,6 +683,11 @@ async function runGames(games, mode) {
 
     for (let index = 0; index < runtimeAgents.length; index += 1) {
       const agent = runtimeAgents[index];
+
+      if (isGameInactive(game.id)) {
+        console.log(`${game.name} became inactive during the cycle. Stopping loop.`);
+        break;
+      }
 
       if (mode === 'run' && cycleContext.sentTransactions >= cycleContext.maxTransactions) {
         console.log(
@@ -668,12 +730,15 @@ async function startAgent() {
     onGameCreated: async (game) => scheduleGameActivation(game, 'game-created'),
     onGameUpdated: async (game, previousGame) => {
       if (!game?.active) {
+        markGameInactive(game.id);
         return {
           status: 'inactive',
           reason: 'Game is not active',
           queuedAt: new Date().toISOString(),
         };
       }
+
+      markGameActive(game.id);
 
       const shouldResync =
         !previousGame?.active ||

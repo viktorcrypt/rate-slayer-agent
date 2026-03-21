@@ -222,6 +222,12 @@ export async function startApiServer(providedAgents = [], hooks = {}) {
 
   app.delete('/games/:id', async (req, res) => {
     try {
+      const existing = await getGameById(req.params.id);
+      if (!existing) {
+        res.status(404).json({ error: 'Game not found' });
+        return;
+      }
+
       const updated = await updateGame(req.params.id, { active: false });
       if (!updated) {
         res.status(404).json({ error: 'Game not found' });
@@ -229,7 +235,7 @@ export async function startApiServer(providedAgents = [], hooks = {}) {
       }
 
       const sync = hooks.onGameUpdated
-        ? await hooks.onGameUpdated(updated, updated)
+        ? await hooks.onGameUpdated(updated, existing)
         : null;
 
       res.json({

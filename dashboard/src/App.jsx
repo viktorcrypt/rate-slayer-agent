@@ -118,6 +118,7 @@ export default function App() {
   const [setupError, setSetupError] = useState('');
   const [inspecting, setInspecting] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [clientEvents, setClientEvents] = useState(() => ([
     buildClientEvent('system', 'ready: paste verified contract address'),
   ]));
@@ -324,6 +325,39 @@ export default function App() {
     }
   };
 
+  const handleStopGame = async () => {
+    if (!focusGame) {
+      return;
+    }
+
+    setStopping(true);
+    setSetupError('');
+    appendClientEvent('operator', `stop ${focusGame.name}`);
+
+    try {
+      const payload = await fetchJson(`${GAMES_ENDPOINT}/${focusGame.id}`, {
+        method: 'DELETE',
+      });
+
+      appendClientEvent(
+        'system',
+        `stop ${payload.sync?.status || 'ok'}${payload.sync?.reason ? ` | ${payload.sync.reason}` : ''}`
+      );
+
+      setSetup((previous) => ({
+        ...previous,
+        activation: null,
+      }));
+
+      await loadSnapshot();
+    } catch (error) {
+      setSetupError(error.message || 'Failed to stop game');
+      appendClientEvent('system', `stop failed: ${error.message || 'unknown error'}`);
+    } finally {
+      setStopping(false);
+    }
+  };
+
   const focusAgentAddress = getFocusAgentAddress(data.state);
   const focusGame = getFocusGame(data.state, focusAgentAddress);
   const focusDecision = getFocusDecision(data.state, focusAgentAddress, focusGame?.id);
@@ -503,6 +537,20 @@ export default function App() {
           <div className="stage-bar">
             <span>activity</span>
             <span>{focusAgentAddress ? truncateAddress(focusAgentAddress) : 'no active unit'}</span>
+          </div>
+
+          <div className="activity-controls">
+            <span>{focusGame ? 'live game armed' : 'no active game'}</span>
+            {focusGame ? (
+              <button
+                className="terminal-button terminal-button-danger"
+                disabled={stopping}
+                onClick={handleStopGame}
+                type="button"
+              >
+                {stopping ? 'stopping' : 'stop'}
+              </button>
+            ) : null}
           </div>
 
           <div className="activity-head">
