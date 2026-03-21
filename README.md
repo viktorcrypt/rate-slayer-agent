@@ -1,43 +1,83 @@
-# Rate Slayer Workspace
+# RateSlayer Gaming Agent
 
-This repo is a workspace monorepo with:
+RateSlayer is an onchain gaming agent for Base where the human stays in control.
 
-- `agent/`: the autonomous Base agent runtime
-- `dashboard/`: the React dashboard and setup wizard
+The core idea is simple:
 
-## Current Flow
+- a user pastes a verified game contract address
+- the agent reads the ABI and surfaces the game functions it can see
+- the human decides what actions the agent is allowed to use
+- the human sets hard spending and cadence limits
+- the agent starts operating within those limits
+- every decision and transaction is visible and auditable
 
-The system now supports a hackathon-friendly flow for BeatPowell-style games:
+## Hackathon Angle
+
+This project is built around the idea of **agents that pay**, but with **human-defined boundaries**.
+
+Instead of giving an agent an open wallet and hoping it behaves, the operator defines:
+
+- maximum ETH the agent can spend per day
+- how many times it can act per day
+- how often it is allowed to act
+- which onchain game actions it is allowed to use
+
+The result is an agent that can play autonomously, while the human still controls risk.
+
+## Demo Flow
 
 1. Open the dashboard
-2. Paste a Base contract address
-3. Inspect the verified ABI from the explorer
-4. See detected supported actions such as `press()` and `pressWithBet()`
-5. Enter a human policy like:
-   - `10 press per day`
-   - `1 paid hit per day`
-   - `do not spend more than 0.00001 ETH per day`
-   - `wait at least 60 minutes between actions`
-6. Save the game
-7. Let the agent enforce those rules and show results in the dashboard
+2. Paste a verified Base game contract address
+3. The agent inspects the ABI and shows the contract functions
+4. Select the actions you want the agent to use
+5. Set daily ETH spend and action frequency limits
+6. Launch the agent
+7. Watch the live activity feed and transaction history
+
+For the main demo, the reference game is Beat Powell V2 on Base.
+
+## What The Operator Controls
+
+The dashboard is designed around operator control, not blind autonomy.
+
+The human can define:
+
+- `ETH per day`
+- `free actions per day`
+- `paid actions per day`
+- `minimum minutes between actions`
+
+These limits are enforced by the runtime, not just suggested to the model.
+
+## What The Agent Does
+
+Once configured, the agent:
+
+- reads verified ABI data from the explorer
+- reasons about the current game state
+- decides whether to act or skip
+- respects the configured spend and timing limits
+- records decisions and onchain activity
+
+The dashboard shows:
+
+- detected game functions
+- selected action set
+- current game state
+- last decision and reason
+- recent activity feed
+- recent transaction linkouts to BaseScan
 
 ## Architecture
 
-- PostgreSQL stores active games, parsed policy, decisions, and transactions
-- Express exposes `/state`, `/games`, `/contracts/inspect`, and `/policies/parse`
-- The agent loop loads active games from PostgreSQL
-- The setup layer inspects verified ABI data from the explorer and derives supported actions
-- Groq is used for:
-  - runtime action decisions
-  - setup-time contract summary
-  - setup-time policy parsing
-- Policy enforcement is deterministic in code:
-  - free press per day limit
-  - paid hit per day limit
-  - daily ETH spend limit
-  - minimum minutes between actions
+- `agent/` runs the autonomous runtime
+- `dashboard/` is the React terminal-style operator UI
+- PostgreSQL stores games, decisions, transactions, and daily state
+- Express exposes the API used by the dashboard
+- Groq is used for contract summarization and runtime decisioning
+- policy enforcement is done deterministically in code
 
-## Structure
+## Monorepo Structure
 
 ```text
 rate-slayer-agent/
@@ -56,6 +96,7 @@ rate-slayer-agent/
 |  |- public/
 |  |- src/
 |  |  |- App.jsx
+|  |  |- dashboard-lib.js
 |  |  |- main.jsx
 |  |  \- styles.css
 |  |- index.html
@@ -91,18 +132,14 @@ Run both:
 npm run dev
 ```
 
-## Agent Commands
-
-From `agent/`:
+From `agent/` you can also run:
 
 ```bash
 npm run once
 npm run status
 ```
 
-## Environment
-
-Important env vars:
+## Important Environment Variables
 
 - `DATABASE_URL`
 - `AGENT_PRIVATE_KEYS`
@@ -110,10 +147,26 @@ Important env vars:
 - `BASE_RPC_URL_READ`
 - `BASE_RPC_URL_WRITE`
 - `ETHERSCAN_API_KEY`
-- `ETHERSCAN_API_URL` default `https://api.etherscan.io/v2/api`
-- `BASE_CHAIN_ID` default `8453`
+- `ETHERSCAN_API_URL`
+- `BASE_CHAIN_ID`
 - `GROQ_API_KEY`
-- `AGENT_API_URL` for dashboard proxying in local dev
-- `AGENT_POLL_CRON` default `*/5 * * * *`
+- `GROQ_MAX_DAILY_ETH_SPEND`
+- `AGENT_POLL_CRON`
+- `AGENT_API_URL`
+
+Useful for demos:
+
+- `DEMO_AGENT_ADDRESS`
+  Limits runtime activity to one visible demo wallet
 
 Root `.env` remains the default source for both workspace packages.
+
+## Short Pitch
+
+Paste a game contract.
+
+Let the agent inspect the ABI.
+
+Tell it how much it may spend and how often it may act.
+
+Then let it play onchain, with the human still in control.
