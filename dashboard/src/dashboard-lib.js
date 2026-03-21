@@ -26,6 +26,7 @@ export function createSetupState() {
     dailyFreePressLimit: DEFAULT_FREE_PRESS_LIMIT,
     dailyPaidPressLimit: DEFAULT_PAID_PRESS_LIMIT,
     minMinutesBetweenActions: DEFAULT_MIN_CADENCE_MINUTES,
+    selectedActions: [],
     inspection: null,
     activation: null,
   };
