@@ -1,19 +1,19 @@
 {
   "name": "rate-slayer-agent",
   "version": "1.0.0",
-  "description": "Autonomous agent that plays Rate Slayer game on Base",
-  "main": "index.js",
-  "type": "module",
+  "private": true,
+  "description": "Rate Slayer workspace with agent runtime and dashboard",
+  "workspaces": [
+    "agent",
+    "dashboard"
+  ],
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js",
-    "once": "node index.js --once"
+    "agent": "cd agent && node index.js",
+    "dashboard": "cd dashboard && npm run dev",
+    "dev": "concurrently \"npm run agent\" \"npm run dashboard\""
   },
-  "dependencies": {
-    "viem": "^2.21.54",
-    "dotenv": "^16.4.5",
-    "node-cron": "^3.0.3",
-    "axios": "^1.7.9"
+  "devDependencies": {
+    "concurrently": "^9.1.2"
   },
   "engines": {
     "node": ">=18.0.0"

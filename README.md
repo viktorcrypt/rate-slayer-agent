@@ -1,65 +1,119 @@
-# 🤖 Rate Slayer Agent
+# Rate Slayer Workspace
 
-Autonomous onchain gaming agent running on Base.
+This repo is a workspace monorepo with:
 
-Built for **OpenClaw Builder Quest (Base Agent Track)** with no human in the loop.
+- `agent/`: the autonomous Base agent runtime
+- `dashboard/`: the React dashboard and setup wizard
 
-## 🧠 Core Idea
-This project is bigger than one game.
+## Current Flow
 
-Right now, the live demo behavior is shown through **BeatPowell / Rate Slayer**.  
-The core architecture is designed so the same agent system can later plug into **other onchain games** and run different strategies there too.
+The system now supports a hackathon-friendly flow for BeatPowell-style games:
 
-## 🎯 What It Does
-- Automatically hits Powell every hour to lower the Fed rate.
-- Posts updates to Farcaster about successful actions.
-- Runs 24/7 with cron scheduling.
-- Supports one or many wallet agents in one process.
-- Uses Base onchain transactions and builder attribution.
+1. Open the dashboard
+2. Paste a Base contract address
+3. Inspect the verified ABI from the explorer
+4. See detected supported actions such as `press()` and `pressWithBet()`
+5. Enter a human policy like:
+   - `10 press per day`
+   - `1 paid hit per day`
+   - `do not spend more than 0.00001 ETH per day`
+   - `wait at least 60 minutes between actions`
+6. Save the game
+7. Let the agent enforce those rules and show results in the dashboard
 
-## 🏆 OpenClaw Builder Quest Submission
-This agent qualifies for the contest because:
-- Autonomous: no human in the loop, runs on cron.
-- Onchain transactions: calls smart contract on Base.
-- Social presence: posts successful updates to Farcaster.
-- Onchain primitives: uses Base smart contracts and wallet signing.
-- Novel use case: gaming + DeFi automation.
+## Architecture
 
-Project references:
-- Farcaster Profile: https://farcaster.xyz/vikigraf
-- Contract: `0xeC6AF3c5934F383972bb9980A51EC976099270b8`
-- App: `https://rate-slayer.vercel.app`
+- PostgreSQL stores active games, parsed policy, decisions, and transactions
+- Express exposes `/state`, `/games`, `/contracts/inspect`, and `/policies/parse`
+- The agent loop loads active games from PostgreSQL
+- The setup layer inspects verified ABI data from the explorer and derives supported actions
+- Groq is used for:
+  - runtime action decisions
+  - setup-time contract summary
+  - setup-time policy parsing
+- Policy enforcement is deterministic in code:
+  - free press per day limit
+  - paid hit per day limit
+  - daily ETH spend limit
+  - minimum minutes between actions
 
-## 📡 Monitoring The Agent
-Track activity through:
-- Farcaster feed for successful bot posts.
-- Basescan contract page for onchain transactions.
-- Service logs for cooldown, retries, and execution flow.
+## Structure
 
-## 🛠️ Technical Details
-- Blockchain: Base (Chain ID 8453).
-- Contract: Rate Slayer game contract.
-- Framework: Node.js + viem.
-- Scheduler: node-cron.
-- Social: Farcaster via Neynar API.
+```text
+rate-slayer-agent/
+|- agent/
+|  |- src/
+|  |  |- api.js
+|  |  |- brain.js
+|  |  |- db.js
+|  |  |- executor.js
+|  |  |- guard.js
+|  |  \- setup.js
+|  |- index.js
+|  |- package.json
+|  \- .env.example
+|- dashboard/
+|  |- public/
+|  |- src/
+|  |  |- App.jsx
+|  |  |- main.jsx
+|  |  \- styles.css
+|  |- index.html
+|  |- package.json
+|  \- vite.config.js
+|- package.json
+\- README.md
+```
 
-## 🚀 Run
+## Install
+
 ```bash
 npm install
-npm start
 ```
 
-## 🧪 Test Commands
+## Run
+
+Run the agent:
+
+```bash
+npm run agent
+```
+
+Run the dashboard:
+
+```bash
+npm run dashboard
+```
+
+Run both:
+
+```bash
+npm run dev
+```
+
+## Agent Commands
+
+From `agent/`:
+
 ```bash
 npm run once
-node index.js --status
+npm run status
 ```
 
-## 🆘 Support
-If something fails:
-- Check logs first.
-- Verify runtime environment variables are set.
-- Ensure each active wallet has ETH on Base.
-- Test once before long-running mode.
+## Environment
 
-Built for OpenClaw Builder Quest on Base.
+Important env vars:
+
+- `DATABASE_URL`
+- `AGENT_PRIVATE_KEYS`
+- `AGENT_NAMES`
+- `BASE_RPC_URL_READ`
+- `BASE_RPC_URL_WRITE`
+- `ETHERSCAN_API_KEY`
+- `ETHERSCAN_API_URL` default `https://api.etherscan.io/v2/api`
+- `BASE_CHAIN_ID` default `8453`
+- `GROQ_API_KEY`
+- `AGENT_API_URL` for dashboard proxying in local dev
+- `AGENT_POLL_CRON` default `*/5 * * * *`
+
+Root `.env` remains the default source for both workspace packages.

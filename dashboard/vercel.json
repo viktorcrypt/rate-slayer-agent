@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://laudable-upliftment-production-9af6.up.railway.app/:path*"
+    }
+  ]
+}
