@@ -77,6 +77,8 @@ const farcasterPostState = {
   dayKey: '',
   successPostsToday: 0,
 };
+let runtimeTaskChain = Promise.resolve();
+const pendingGameActivations = new Set();
 
 function randomInt(min, max) {
   if (max <= min) {
@@ -125,6 +127,59 @@ function canPostSuccessToFarcaster(now = new Date()) {
 function markSuccessPostToFarcaster(now = new Date()) {
   refreshFarcasterPostWindow(now);
   farcasterPostState.successPostsToday += 1;
+}
+
+function enqueueRuntimeTask(label, task) {
+  runtimeTaskChain = runtimeTaskChain
+    .catch(() => undefined)
+    .then(async () => {
+      console.log(`[runtime] ${label} started`);
+      try {
+        return await task();
+      } finally {
+        console.log(`[runtime] ${label} finished`);
+      }
+    });
+
+  return runtimeTaskChain;
+}
+
+function scheduleGameActivation(game, reason = 'game-created') {
+  const activationKey = String(game?.id || game?.contract_address || '').trim();
+  if (!activationKey) {
+    return {
+      status: 'skipped',
+      reason: 'Missing game identifier',
+      queuedAt: new Date().toISOString(),
+    };
+  }
+
+  if (pendingGameActivations.has(activationKey)) {
+    return {
+      status: 'already-queued',
+      reason,
+      queuedAt: new Date().toISOString(),
+    };
+  }
+
+  pendingGameActivations.add(activationKey);
+
+  void enqueueRuntimeTask(`activate:${game.name}:${reason}`, async () => {
+    try {
+      await ensureAgentsRegisteredOnchain([game]);
+      await runGames([game], 'run');
+    } catch (error) {
+      console.error(`[runtime] Activation failed for ${game.name}:`, error);
+    } finally {
+      pendingGameActivations.delete(activationKey);
+    }
+  });
+
+  return {
+    status: 'queued',
+    reason,
+    queuedAt: new Date().toISOString(),
+  };
 }
 
 function isInsufficientFundsError(error) {
@@ -531,8 +586,7 @@ async function runAgentForGame(agent, game, cycleContext = null) {
   }
 }
 
-async function runAllGames(mode) {
-  const games = await getActiveGames();
+async function runGames(games, mode) {
   if (games.length === 0) {
     console.log('No active games found.');
     return;
@@ -595,9 +649,39 @@ async function runAllGames(mode) {
   }
 }
 
+async function runAllGames(mode) {
+  const games = await getActiveGames();
+  await runGames(games, mode);
+}
+
 async function startAgent() {
   await initDb();
-  await startApiServer(agents);
+  await startApiServer(agents, {
+    onGameCreated: async (game) => scheduleGameActivation(game, 'game-created'),
+    onGameUpdated: async (game, previousGame) => {
+      if (!game?.active) {
+        return {
+          status: 'inactive',
+          reason: 'Game is not active',
+          queuedAt: new Date().toISOString(),
+        };
+      }
+
+      const shouldResync =
+        !previousGame?.active ||
+        String(previousGame?.daily_limit_wei || '') !== String(game.daily_limit_wei || '');
+
+      if (!shouldResync) {
+        return {
+          status: 'noop',
+          reason: 'No runtime sync required',
+          queuedAt: new Date().toISOString(),
+        };
+      }
+
+      return scheduleGameActivation(game, 'game-updated');
+    },
+  });
 
   console.log('\nMulti-Game Agent Started!\n');
   console.log(`Scheduler cron: ${AGENT_POLL_CRON}`);
@@ -634,18 +718,24 @@ async function startAgent() {
 
   if (process.argv.includes('--once')) {
     console.log('Running in test mode (one-time execution)');
-    await runAllGames('run');
+    await enqueueRuntimeTask('once-run', async () => {
+      await runAllGames('run');
+    });
     process.exit(0);
   }
 
   if (RUN_ON_START) {
-    await runAllGames('run');
+    await enqueueRuntimeTask('startup-run', async () => {
+      await runAllGames('run');
+    });
   } else {
     console.log('Startup run skipped. Waiting for next scheduled cycle.');
   }
 
   cron.schedule(AGENT_POLL_CRON, async () => {
-    await runAllGames('run');
+    await enqueueRuntimeTask(`cron:${new Date().toISOString()}`, async () => {
+      await runAllGames('run');
+    });
   });
 
   console.log(`Scheduler active. Agents will run on cron ${AGENT_POLL_CRON}.`);

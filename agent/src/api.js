@@ -28,7 +28,7 @@ function sendError(res, error, fallbackMessage, statusCode = 500) {
   res.status(statusCode).json({ error: error?.message || fallbackMessage });
 }
 
-export async function startApiServer(providedAgents = []) {
+export async function startApiServer(providedAgents = [], hooks = {}) {
   if (serverPromise) {
     return serverPromise;
   }
@@ -135,10 +135,15 @@ export async function startApiServer(providedAgents = []) {
         setupSummary: inspection.setupSummary,
       });
 
+      const activation = hooks.onGameCreated
+        ? await hooks.onGameCreated(created)
+        : null;
+
       res.status(201).json({
         game: created,
         inspection,
         parsedPolicy,
+        activation,
       });
     } catch (error) {
       sendError(res, error, 'Failed to create game', 400);
@@ -194,7 +199,14 @@ export async function startApiServer(providedAgents = []) {
         return;
       }
 
-      res.json(updated);
+      const sync = hooks.onGameUpdated
+        ? await hooks.onGameUpdated(updated, existing)
+        : null;
+
+      res.json({
+        game: updated,
+        sync,
+      });
     } catch (error) {
       sendError(res, error, 'Failed to update game', 400);
     }
@@ -208,7 +220,14 @@ export async function startApiServer(providedAgents = []) {
         return;
       }
 
-      res.json(updated);
+      const sync = hooks.onGameUpdated
+        ? await hooks.onGameUpdated(updated, updated)
+        : null;
+
+      res.json({
+        game: updated,
+        sync,
+      });
     } catch (error) {
       sendError(res, error, 'Failed to deactivate game');
     }
