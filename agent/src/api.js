@@ -13,6 +13,7 @@ import {
 import { inspectGameContract, parseGamePolicy } from './setup.js';
 
 const PORT = Number(process.env.PORT || 3001);
+const DASHBOARD_ADMIN_TOKEN = String(process.env.DASHBOARD_ADMIN_TOKEN || '').trim();
 
 let serverPromise;
 
@@ -26,6 +27,33 @@ function getAgentAddresses(providedAgents) {
 
 function sendError(res, error, fallbackMessage, statusCode = 500) {
   res.status(statusCode).json({ error: error?.message || fallbackMessage });
+}
+
+function getRequestAdminToken(req) {
+  const headerToken = String(req.get('x-admin-token') || '').trim();
+  if (headerToken) {
+    return headerToken;
+  }
+
+  const authHeader = String(req.get('authorization') || '').trim();
+  if (authHeader.toLowerCase().startsWith('bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+
+  return '';
+}
+
+function requireAdminToken(req, res) {
+  if (!DASHBOARD_ADMIN_TOKEN) {
+    return true;
+  }
+
+  if (getRequestAdminToken(req) === DASHBOARD_ADMIN_TOKEN) {
+    return true;
+  }
+
+  res.status(401).json({ error: 'Access code required' });
+  return false;
 }
 
 export async function startApiServer(providedAgents = [], hooks = {}) {
@@ -99,6 +127,10 @@ export async function startApiServer(providedAgents = [], hooks = {}) {
   });
 
   app.post('/games', async (req, res) => {
+    if (!requireAdminToken(req, res)) {
+      return;
+    }
+
     const {
       contractAddress,
       name,
@@ -159,6 +191,10 @@ export async function startApiServer(providedAgents = [], hooks = {}) {
   });
 
   app.patch('/games/:id', async (req, res) => {
+    if (!requireAdminToken(req, res)) {
+      return;
+    }
+
     try {
       const existing = await getGameById(req.params.id);
       if (!existing) {
@@ -221,6 +257,10 @@ export async function startApiServer(providedAgents = [], hooks = {}) {
   });
 
   app.delete('/games/:id', async (req, res) => {
+    if (!requireAdminToken(req, res)) {
+      return;
+    }
+
     try {
       const existing = await getGameById(req.params.id);
       if (!existing) {

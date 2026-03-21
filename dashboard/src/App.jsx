@@ -32,6 +32,7 @@ import {
 const STATE_ENDPOINT = '/api/state';
 const GAMES_ENDPOINT = '/api/games';
 const CONTRACT_INSPECT_ENDPOINT = '/api/contracts/inspect';
+const ADMIN_TOKEN_STORAGE_KEY = 'rate-slayer-admin-token';
 const contractAbi = parseAbi([
   'function getCurrentRate() view returns (uint256)',
 ]);
@@ -104,6 +105,41 @@ function actionOptionHint(action, inspection) {
   }
 
   return 'abi';
+}
+
+function getStoredAdminToken() {
+  if (typeof window === 'undefined') {
+    return '';
+  }
+
+  return window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '';
+}
+
+function clearStoredAdminToken() {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+}
+
+function requestAdminToken() {
+  if (typeof window === 'undefined') {
+    return '';
+  }
+
+  const existingToken = getStoredAdminToken();
+  if (existingToken) {
+    return existingToken;
+  }
+
+  const token = window.prompt('Access code');
+  const normalized = String(token || '').trim();
+  if (normalized) {
+    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, normalized);
+  }
+
+  return normalized;
 }
 
 export default function App() {
@@ -282,6 +318,12 @@ export default function App() {
       : 0;
     const cadence = toInteger(setup.minMinutesBetweenActions, 60, 1);
     const policyText = buildSelectedPolicyText(setup);
+    const adminToken = requestAdminToken();
+    if (!adminToken) {
+      setSetupError('Access code required.');
+      appendClientEvent('system', 'launch blocked: access code required');
+      return;
+    }
 
     setSubmitting(true);
     setSetupError('');
@@ -290,7 +332,10 @@ export default function App() {
     try {
       const payload = await fetchJson(GAMES_ENDPOINT, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-token': adminToken,
+        },
         body: JSON.stringify({
           contractAddress: setup.contractAddress,
           name: setup.inspection.nameSuggestion || setup.inspection.contractName,
@@ -318,6 +363,9 @@ export default function App() {
         void loadSnapshot();
       }, 5000);
     } catch (error) {
+      if (String(error.message || '').includes('Access code required')) {
+        clearStoredAdminToken();
+      }
       setSetupError(error.message || 'Failed to arm agent');
       appendClientEvent('system', `launch failed: ${error.message || 'unknown error'}`);
     } finally {
@@ -330,6 +378,13 @@ export default function App() {
       return;
     }
 
+    const adminToken = requestAdminToken();
+    if (!adminToken) {
+      setSetupError('Access code required.');
+      appendClientEvent('system', 'stop blocked: access code required');
+      return;
+    }
+
     setStopping(true);
     setSetupError('');
     appendClientEvent('operator', `stop ${focusGame.name}`);
@@ -337,6 +392,9 @@ export default function App() {
     try {
       const payload = await fetchJson(`${GAMES_ENDPOINT}/${focusGame.id}`, {
         method: 'DELETE',
+        headers: {
+          'x-admin-token': adminToken,
+        },
       });
 
       appendClientEvent(
@@ -351,6 +409,9 @@ export default function App() {
 
       await loadSnapshot();
     } catch (error) {
+      if (String(error.message || '').includes('Access code required')) {
+        clearStoredAdminToken();
+      }
       setSetupError(error.message || 'Failed to stop game');
       appendClientEvent('system', `stop failed: ${error.message || 'unknown error'}`);
     } finally {
@@ -458,13 +519,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {!setup.inspection.runtimeCompatible ? (
-                  <div className="inspect-note">
-                    inspect only | missing: {setup.inspection.missingRequiredFunctions.join(', ')}
-                  </div>
-                ) : null}
-
-                {setup.inspection.runtimeCompatible && selectedActions.length > 0 ? (
+                {selectedActions.length > 0 ? (
                   <div className="limits-panel">
                     <div className="block-label">Limits</div>
                     <div className="limit-grid">
