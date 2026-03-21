@@ -63,6 +63,7 @@ const AGENT_DAILY_TX_MAX = Math.max(AGENT_DAILY_TX_MIN, Number(process.env.AGENT
 const RUN_ON_START = String(process.env.RUN_ON_START || 'false').toLowerCase() === 'true';
 const FARCASTER_MAX_SUCCESS_POSTS_PER_DAY = 1;
 const CAST_PERSONAS = ['Atlas', 'Rook', 'Mantis', 'Viper', 'Nova', 'Sentinel', 'Cipher', 'Falcon'];
+const DEMO_AGENT_ADDRESS = process.env.DEMO_AGENT_ADDRESS?.trim().toLowerCase() || '';
 
 let AGENT_MIN_BALANCE_WEI;
 try {
@@ -72,6 +73,9 @@ try {
 }
 
 const agents = createAgentContexts();
+const runtimeAgents = DEMO_AGENT_ADDRESS
+  ? agents.filter((agent) => agent.account.address.toLowerCase() === DEMO_AGENT_ADDRESS)
+  : agents;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const farcasterPostState = {
   dayKey: '',
@@ -242,7 +246,7 @@ async function postToFarcaster(text) {
 
 async function ensureAgentsRegisteredOnchain(games) {
   for (const game of games) {
-    for (const agent of agents) {
+    for (const agent of runtimeAgents) {
       try {
         const stats = await getAgentStatsOnchain(game.contract_address, agent.account.address);
         if (stats.isRegistered) {
@@ -620,8 +624,8 @@ async function runGames(games, mode) {
       break;
     }
 
-    for (let index = 0; index < agents.length; index += 1) {
-      const agent = agents[index];
+    for (let index = 0; index < runtimeAgents.length; index += 1) {
+      const agent = runtimeAgents[index];
 
       if (mode === 'run' && cycleContext.sentTransactions >= cycleContext.maxTransactions) {
         console.log(
@@ -640,7 +644,7 @@ async function runGames(games, mode) {
         console.error(`[${agent.name}] Unhandled loop error for ${game.name}:`, error);
       }
 
-      const shouldWait = index < agents.length - 1 && AGENT_RUN_STAGGER_MS > 0;
+      const shouldWait = index < runtimeAgents.length - 1 && AGENT_RUN_STAGGER_MS > 0;
       if (shouldWait) {
         console.log(`Waiting ${AGENT_RUN_STAGGER_MS}ms before next agent...`);
         await sleep(AGENT_RUN_STAGGER_MS);
@@ -656,7 +660,11 @@ async function runAllGames(mode) {
 
 async function startAgent() {
   await initDb();
-  await startApiServer(agents, {
+  if (DEMO_AGENT_ADDRESS && runtimeAgents.length === 0) {
+    throw new Error(`DEMO_AGENT_ADDRESS ${DEMO_AGENT_ADDRESS} does not match any configured agent.`);
+  }
+
+  await startApiServer(runtimeAgents, {
     onGameCreated: async (game) => scheduleGameActivation(game, 'game-created'),
     onGameUpdated: async (game, previousGame) => {
       if (!game?.active) {
@@ -685,13 +693,16 @@ async function startAgent() {
 
   console.log('\nMulti-Game Agent Started!\n');
   console.log(`Scheduler cron: ${AGENT_POLL_CRON}`);
-  console.log('Agents configured:', agents.length);
-  for (const agent of agents) {
+  console.log('Agents configured:', runtimeAgents.length);
+  if (DEMO_AGENT_ADDRESS) {
+    console.log(`Demo agent mode: ${DEMO_AGENT_ADDRESS}`);
+  }
+  for (const agent of runtimeAgents) {
     console.log(`Agent ${agent.name}: ${agent.account.address}`);
   }
 
-  const uniqueAgentCount = new Set(agents.map((agent) => agent.account.address.toLowerCase())).size;
-  if (uniqueAgentCount !== agents.length) {
+  const uniqueAgentCount = new Set(runtimeAgents.map((agent) => agent.account.address.toLowerCase())).size;
+  if (uniqueAgentCount !== runtimeAgents.length) {
     console.log('WARNING: Duplicate agent addresses detected. Use unique private keys for true multi-agent behavior.');
   }
 
