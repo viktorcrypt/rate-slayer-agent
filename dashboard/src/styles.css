@@ -221,6 +221,8 @@ input {
   display: flex;
   flex-direction: column;
   gap: 0.6rem;
+  max-height: 20rem;
+  overflow: auto;
 }
 
 .action-chip {
@@ -255,6 +257,15 @@ input {
   margin-top: 1rem;
   padding-top: 1rem;
   border-top: 1px solid var(--line);
+}
+
+.inspect-note {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+  color: var(--amber);
+  line-height: 1.6;
+  font-size: 0.78rem;
 }
 
 .limit-grid {

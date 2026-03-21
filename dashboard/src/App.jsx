@@ -90,6 +90,22 @@ function actionOptionText(action) {
   return action;
 }
 
+function actionOptionHint(action, inspection) {
+  if (action === 'pressWithBet') {
+    return 'paid hit';
+  }
+
+  if (action === 'press') {
+    return 'free hit';
+  }
+
+  if (inspection?.supportedActions?.includes(action)) {
+    return 'runtime';
+  }
+
+  return 'abi';
+}
+
 export default function App() {
   const [data, setData] = useState({
     state: createEmptyState(),
@@ -204,12 +220,14 @@ export default function App() {
         ...previous,
         inspection,
         activation: null,
-        selectedActions: Array.isArray(inspection.supportedActions) ? [...inspection.supportedActions] : [],
+        selectedActions: inspection.runtimeCompatible && Array.isArray(inspection.supportedActions)
+          ? [...inspection.supportedActions]
+          : [],
       }));
 
       appendClientEvent(
         'system',
-        `abi loaded: ${inspection.functionSignatures.length} functions | actions ${inspection.supportedActions.map(actionOptionText).join(', ')}`
+        `abi loaded: ${inspection.functionSignatures.length} functions | ${inspection.runtimeCompatible ? 'runtime ready' : 'inspect only'}`
       );
     } catch (error) {
       setSetupError(error.message || 'Failed to inspect contract');
@@ -318,6 +336,21 @@ export default function App() {
   const terminalLines = buildTerminalLines(clientEvents, data.state, focusAgentAddress);
   const selectedActions = setup.selectedActions || [];
   const policyPreview = useMemo(() => buildSelectedPolicyText(setup), [setup]);
+  const visibleActions = useMemo(() => {
+    if (!setup.inspection) {
+      return [];
+    }
+
+    if (Array.isArray(setup.inspection.availableActions) && setup.inspection.availableActions.length > 0) {
+      return setup.inspection.availableActions;
+    }
+
+    if (Array.isArray(setup.inspection.functionNames)) {
+      return setup.inspection.functionNames;
+    }
+
+    return [];
+  }, [setup.inspection]);
 
   return (
     <div className="terminal-shell">
@@ -326,7 +359,7 @@ export default function App() {
       <main className="terminal-layout">
         <section className="terminal-stage">
           <div className="stage-bar">
-            <span>Synthesis / field terminal</span>
+            <span>RATESLAYER GAMING AGENT</span>
             <span>{data.lastUpdated ? formatClock(data.lastUpdated) : 'booting'}</span>
           </div>
 
@@ -373,7 +406,7 @@ export default function App() {
                   <div className="block">
                     <div className="block-label">Actions</div>
                     <div className="action-list">
-                      {setup.inspection.supportedActions.map((action) => {
+                      {visibleActions.map((action) => {
                         const active = selectedActions.includes(action);
                         return (
                           <button
@@ -383,7 +416,7 @@ export default function App() {
                             type="button"
                           >
                             <span>{actionOptionText(action)}</span>
-                            <small>{humanizeAction(action)}</small>
+                            <small>{actionOptionHint(action, setup.inspection)}</small>
                           </button>
                         );
                       })}
@@ -391,7 +424,13 @@ export default function App() {
                   </div>
                 </div>
 
-                {selectedActions.length > 0 ? (
+                {!setup.inspection.runtimeCompatible ? (
+                  <div className="inspect-note">
+                    inspect only | missing: {setup.inspection.missingRequiredFunctions.join(', ')}
+                  </div>
+                ) : null}
+
+                {setup.inspection.runtimeCompatible && selectedActions.length > 0 ? (
                   <div className="limits-panel">
                     <div className="block-label">Limits</div>
                     <div className="limit-grid">

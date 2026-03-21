@@ -112,6 +112,14 @@ export async function startApiServer(providedAgents = [], hooks = {}) {
 
     try {
       const inspection = await inspectGameContract(contractAddress);
+      if (!inspection.runtimeCompatible) {
+        res.status(400).json({
+          error: `Inspect-only contract. Missing runtime functions: ${inspection.missingRequiredFunctions.join(', ')}`,
+          inspection,
+        });
+        return;
+      }
+
       const parsedPolicy = await parseGamePolicy({
         policyText,
         supportedActions: inspection.supportedActions,

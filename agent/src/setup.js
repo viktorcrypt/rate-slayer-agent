@@ -117,6 +117,18 @@ function buildFallbackPolicySuggestion(capabilities) {
   return parts.join(', ');
 }
 
+function buildOperatorOptions(capabilities) {
+  if (capabilities.runtimeCompatible && capabilities.supportedActions.length > 0) {
+    return capabilities.supportedActions.map((action) => (
+      action === 'press'
+        ? 'Free press via press()'
+        : 'Paid hit via pressWithBet()'
+    ));
+  }
+
+  return capabilities.functionNames.map((functionName) => `ABI: ${functionName}()`);
+}
+
 export function detectContractCapabilities(abi) {
   const functionEntries = getFunctionEntries(abi);
   const functionNames = new Set(functionEntries.map((entry) => entry.name));
@@ -154,12 +166,6 @@ export async function inspectGameContract(contractAddress) {
   }
 
   const capabilities = detectContractCapabilities(abi);
-  if (!capabilities.runtimeCompatible) {
-    throw new Error(
-      `Contract is not runtime-compatible yet. Missing required functions: ${capabilities.missingRequiredFunctions.join(', ')}`
-    );
-  }
-
   const analysis = await analyzeContractSetup({
     contractAddress: normalizedAddress,
     contractName: sourceEntry?.ContractName || '',
@@ -173,6 +179,9 @@ export async function inspectGameContract(contractAddress) {
     sourceVerified,
     abiJson: JSON.stringify(abi),
     supportedActions: capabilities.supportedActions,
+    availableActions: capabilities.runtimeCompatible
+      ? capabilities.supportedActions
+      : capabilities.functionNames,
     functionNames: capabilities.functionNames,
     functionSignatures: capabilities.functionSignatures,
     runtimeCompatible: capabilities.runtimeCompatible,
@@ -181,12 +190,10 @@ export async function inspectGameContract(contractAddress) {
     nameSuggestion: analysis.nameSuggestion || sourceEntry?.ContractName || `Game ${normalizedAddress.slice(0, 8)}`,
     operatorOptions: Array.isArray(analysis.operatorOptions) && analysis.operatorOptions.length > 0
       ? analysis.operatorOptions
-      : capabilities.supportedActions.map((action) => (
-        action === 'press'
-          ? 'Free press via press()'
-          : 'Paid hit via pressWithBet()'
-      )),
-    setupSummary: analysis.setupSummary || `Detected supported actions: ${capabilities.supportedActions.join(', ')}`,
+      : buildOperatorOptions(capabilities),
+    setupSummary: capabilities.runtimeCompatible
+      ? (analysis.setupSummary || `Detected supported actions: ${capabilities.supportedActions.join(', ')}`)
+      : `Inspection-only contract. ABI loaded, but runtime requirements are missing: ${capabilities.missingRequiredFunctions.join(', ')}`,
     policySuggestion: analysis.policySuggestion || buildFallbackPolicySuggestion(capabilities),
   };
 }
