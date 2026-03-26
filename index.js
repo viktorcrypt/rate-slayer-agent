@@ -11,6 +11,7 @@ dotenv.config();
 
 
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || '0xeC6AF3c5934F383972bb9980A51EC976099270b8';
+const ARENA_CONTRACT_ADDRESS = process.env.ARENA_CONTRACT_ADDRESS || '0x09C1FaD72f10c0Dd4C083A28990Faa8A7C8F0580';
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const AGENT_PRIVATE_KEYS = (process.env.AGENT_PRIVATE_KEYS || '')
   .split(',')
@@ -19,6 +20,12 @@ const AGENT_PRIVATE_KEYS = (process.env.AGENT_PRIVATE_KEYS || '')
 const AGENT_NAMES = (process.env.AGENT_NAMES || '')
   .split(',')
   .map(name => name.trim())
+  .filter(Boolean);
+const ARENA_ENABLED = String(process.env.ARENA_ENABLED || 'false').toLowerCase() === 'true';
+const ARENA_AGENTS_COUNT = Math.max(0, Number(process.env.ARENA_AGENTS_COUNT || 2) || 0);
+const ARENA_CHARACTERS = (process.env.ARENA_CHARACTERS || 'trump,vitalik,satoshi')
+  .split(',')
+  .map(characterId => characterId.trim())
   .filter(Boolean);
 const AGENT_RUN_STAGGER_MS = Math.max(0, Number(process.env.AGENT_RUN_STAGGER_MS || 3000));
 const NEYNAR_API_KEY = process.env.NEYNAR_API_KEY;
@@ -88,6 +95,9 @@ const CONTRACT_ABI = parseAbi([
   'function RATE_INCREASE_PER_HOUR() view returns (uint256)',
   'function DECREASE_PER_PRESS() view returns (uint256)',
   'function MAX_RATE() view returns (uint256)',
+]);
+const ARENA_ABI = parseAbi([
+  'function enterMatch(string characterId, bool won) payable',
 ]);
 
 
@@ -551,6 +561,58 @@ async function pressPowell(agent) {
   return receipt;
 }
 
+async function playArena(agent) {
+  const characterId = pickRandom(ARENA_CHARACTERS);
+  const won = Math.random() > 0.4;
+  const resultLabel = won ? 'won' : 'lost';
+
+  if (!characterId) {
+    console.log(`[${agent.name}] No arena characters configured, skipping 33balances.`);
+    return null;
+  }
+
+  console.log(`[${agent.name}] Playing 33balances as ${characterId} — result: ${resultLabel}`);
+
+  try {
+    const { request } = await withRpcRetry(
+      () => publicClient.simulateContract({
+        account: agent.account,
+        address: ARENA_CONTRACT_ADDRESS,
+        abi: ARENA_ABI,
+        functionName: 'enterMatch',
+        args: [characterId, won],
+        value: parseEther('0.00001'),
+        ...(TX_DATA_SUFFIX ? { dataSuffix: TX_DATA_SUFFIX } : {}),
+      }),
+      `simulateArena:${agent.name}`
+    );
+
+    const hash = await withRpcRetry(
+      () => agent.walletClient.writeContract(request),
+      `writeArena:${agent.name}`
+    );
+    console.log(`[${agent.name}] Arena transaction sent:`, hash);
+
+    const receipt = await withRpcRetry(
+      () => publicClient.waitForTransactionReceipt({ hash }),
+      `waitForArenaReceipt:${agent.name}`
+    );
+    console.log(`[${agent.name}] 33balances transaction confirmed!`);
+
+    return receipt;
+  } catch (error) {
+    console.error(`[${agent.name}] 33balances error:`, error);
+
+    if (isInsufficientFundsError(error)) {
+      console.log(`[${agent.name}] Insufficient ETH for 33balances entry. Top up this wallet to resume arena actions.`);
+    } else {
+      console.log(`[${agent.name}] Skipping 33balances for this run.`);
+    }
+
+    throw error;
+  }
+}
+
 
 
 async function postToFarcaster(text) {
@@ -706,6 +768,32 @@ async function runAgent(agent, cycleContext = null) {
       const postResult = await postToFarcaster(randomMessage);
       if (postResult) {
         markSuccessPostToFarcaster();
+      }
+    }
+
+    if (ARENA_ENABLED && agent.index < ARENA_AGENTS_COUNT) {
+      const arenaDelayMs = randomInt(2000, 5000);
+      console.log(`[${agent.name}] Arena action delay: ${arenaDelayMs}ms`);
+      await sleep(arenaDelayMs);
+
+      try {
+        const arenaReceipt = await playArena(agent);
+        if (arenaReceipt) {
+          if (cycleContext) {
+            const dailyBudget = recordDailyTxSuccess();
+            cycleContext.sentTransactions += 1;
+            console.log(
+              `[${agent.name}] Cycle tx usage: ${cycleContext.sentTransactions}/${cycleContext.maxTransactions}`
+            );
+            console.log(
+              `[${agent.name}] Daily tx usage: ${dailyBudget.sentTransactions}/${dailyBudget.targetTransactions} (${dailyBudget.dayKey})`
+            );
+          } else {
+            recordDailyTxSuccess();
+          }
+        }
+      } catch {
+        // Arena is best-effort and must not fail the main agent run.
       }
     }
 
