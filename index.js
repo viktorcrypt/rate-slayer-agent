@@ -81,6 +81,12 @@ const BUILDER_CODES = (process.env.BUILDER_CODES || '')
   .map(code => code.trim())
   .filter(Boolean);
 const BUILDER_DATA_SUFFIX = process.env.BUILDER_DATA_SUFFIX?.trim();
+const ARENA_BUILDER_CODE = process.env.ARENA_BUILDER_CODE?.trim();
+const ARENA_BUILDER_CODES = (process.env.ARENA_BUILDER_CODES || '')
+  .split(',')
+  .map(code => code.trim())
+  .filter(Boolean);
+const ARENA_BUILDER_DATA_SUFFIX = process.env.ARENA_BUILDER_DATA_SUFFIX?.trim();
 const ERC8021_DATA_SUFFIX = '0x80218021802180218021802180218021';
 const FARCASTER_MAX_SUCCESS_POSTS_PER_DAY = 1;
 const CAST_PERSONAS = ['Atlas', 'Rook', 'Mantis', 'Viper', 'Nova', 'Sentinel', 'Cipher', 'Falcon'];
@@ -129,20 +135,51 @@ function buildErc8021DataSuffix(codes) {
   ]);
 }
 
-function resolveTxDataSuffix() {
-  if (BUILDER_DATA_SUFFIX) {
-    return BUILDER_DATA_SUFFIX;
+function resolveTxDataSuffix({ dataSuffix, codes, code }) {
+  if (dataSuffix) {
+    return dataSuffix;
   }
 
-  const codes = BUILDER_CODES.length > 0 ? BUILDER_CODES : (BUILDER_CODE ? [BUILDER_CODE] : []);
-  if (codes.length === 0) {
+  const resolvedCodes = codes.length > 0 ? codes : (code ? [code] : []);
+  if (resolvedCodes.length === 0) {
     return undefined;
   }
 
-  return buildErc8021DataSuffix(codes);
+  return buildErc8021DataSuffix(resolvedCodes);
 }
 
-const TX_DATA_SUFFIX = resolveTxDataSuffix();
+function resolveAttributionSource({ dataSuffix, codes, code }) {
+  if (dataSuffix) {
+    return 'DATA_SUFFIX';
+  }
+
+  if (codes.length > 0 || code) {
+    return 'BUILDER_CODE(S)';
+  }
+
+  return null;
+}
+
+const TX_DATA_SUFFIX = resolveTxDataSuffix({
+  dataSuffix: BUILDER_DATA_SUFFIX,
+  codes: BUILDER_CODES,
+  code: BUILDER_CODE,
+});
+const TX_ATTRIBUTION_SOURCE = resolveAttributionSource({
+  dataSuffix: BUILDER_DATA_SUFFIX,
+  codes: BUILDER_CODES,
+  code: BUILDER_CODE,
+});
+const ARENA_TX_DATA_SUFFIX = resolveTxDataSuffix({
+  dataSuffix: ARENA_BUILDER_DATA_SUFFIX,
+  codes: ARENA_BUILDER_CODES,
+  code: ARENA_BUILDER_CODE,
+}) ?? TX_DATA_SUFFIX;
+const ARENA_TX_ATTRIBUTION_SOURCE = resolveAttributionSource({
+  dataSuffix: ARENA_BUILDER_DATA_SUFFIX,
+  codes: ARENA_BUILDER_CODES,
+  code: ARENA_BUILDER_CODE,
+}) || (ARENA_TX_DATA_SUFFIX ? 'FALLBACK_TO_POWELL' : null);
 
 
 const publicClient = createPublicClient({
@@ -178,12 +215,19 @@ function createAgentContexts() {
       transport: http(BASE_RPC_URL_WRITE),
       ...(TX_DATA_SUFFIX ? { dataSuffix: TX_DATA_SUFFIX } : {}),
     });
+    const arenaWalletClient = createWalletClient({
+      account,
+      chain: base,
+      transport: http(BASE_RPC_URL_WRITE),
+      ...(ARENA_TX_DATA_SUFFIX ? { dataSuffix: ARENA_TX_DATA_SUFFIX } : {}),
+    });
 
     return {
       index,
       name,
       account,
       walletClient,
+      arenaWalletClient,
     };
   });
 }
@@ -751,7 +795,7 @@ async function playArena(agent) {
     );
 
     const hash = await withRpcRetry(
-      () => agent.walletClient.writeContract(request),
+      () => agent.arenaWalletClient.writeContract(request),
       `writeArena:${agent.name}`
     );
     console.log(`[${agent.name}] Arena transaction sent:`, hash);
@@ -1092,7 +1136,8 @@ async function startAgent() {
   console.log('Farcaster posting:', FARCASTER_POSTS_ENABLED ? 'enabled' : 'disabled');
   console.log('Farcaster posting mode:', 'success-only');
   console.log('Farcaster success post limit:', `${FARCASTER_MAX_SUCCESS_POSTS_PER_DAY} per UTC day`);
-  console.log('Builder attribution:', TX_DATA_SUFFIX ? 'enabled' : 'disabled');
+  console.log('Powell attribution:', TX_DATA_SUFFIX ? 'enabled' : 'disabled');
+  console.log('Arena attribution:', ARENA_TX_DATA_SUFFIX ? 'enabled' : 'disabled');
   console.log('Agent stagger:', `${AGENT_RUN_STAGGER_MS}ms`);
   console.log('Random skip chance:', `${(AGENT_RANDOM_SKIP_CHANCE * 100).toFixed(1)}%`);
   console.log('New agent action chance:', `${(AGENT_NEW_ACTION_CHANCE * 100).toFixed(1)}%`);
@@ -1119,8 +1164,10 @@ async function startAgent() {
     console.log('Arena schedule hours (UTC):', formatArenaScheduleHours());
   }
   if (TX_DATA_SUFFIX) {
-    const attributionSource = BUILDER_DATA_SUFFIX ? 'BUILDER_DATA_SUFFIX' : 'BUILDER_CODE(S)';
-    console.log('Attribution source:', attributionSource);
+    console.log('Powell attribution source:', TX_ATTRIBUTION_SOURCE);
+  }
+  if (ARENA_TX_DATA_SUFFIX) {
+    console.log('Arena attribution source:', ARENA_TX_ATTRIBUTION_SOURCE);
   }
   console.log('\n' + '='.repeat(50) + '\n');
 
