@@ -22,11 +22,20 @@ const AGENT_NAMES = (process.env.AGENT_NAMES || '')
   .map(name => name.trim())
   .filter(Boolean);
 const ARENA_ENABLED = String(process.env.ARENA_ENABLED || 'false').toLowerCase() === 'true';
-const ARENA_AGENTS_COUNT = Math.max(0, Number(process.env.ARENA_AGENTS_COUNT || 2) || 0);
+const ARENA_AGENTS_COUNT = process.env.ARENA_AGENTS_COUNT
+  ? Math.max(0, Number(process.env.ARENA_AGENTS_COUNT) || 0)
+  : Number.MAX_SAFE_INTEGER;
 const ARENA_CHARACTERS = (process.env.ARENA_CHARACTERS || 'trump,vitalik,satoshi')
   .split(',')
   .map(characterId => characterId.trim())
   .filter(Boolean);
+const ARENA_DAILY_TX_MIN = Math.max(0, Number(process.env.ARENA_DAILY_TX_MIN || 4));
+const ARENA_DAILY_TX_MAX = Math.max(ARENA_DAILY_TX_MIN, Number(process.env.ARENA_DAILY_TX_MAX || 5));
+const ARENA_ACTION_DELAY_MIN_MS = Math.max(0, Number(process.env.ARENA_ACTION_DELAY_MIN_MS || 2000));
+const ARENA_ACTION_DELAY_MAX_MS = Math.max(
+  ARENA_ACTION_DELAY_MIN_MS,
+  Number(process.env.ARENA_ACTION_DELAY_MAX_MS || 5000)
+);
 const AGENT_RUN_STAGGER_MS = Math.max(0, Number(process.env.AGENT_RUN_STAGGER_MS || 3000));
 const NEYNAR_API_KEY = process.env.NEYNAR_API_KEY;
 const FARCASTER_SIGNER_UUID = process.env.FARCASTER_SIGNER_UUID;
@@ -82,6 +91,8 @@ try {
 } catch {
   throw new Error(`Invalid AGENT_MIN_BALANCE_ETH value: "${AGENT_MIN_BALANCE_ETH}"`);
 }
+const ARENA_ENTRY_FEE_WEI = parseEther('0.00001');
+const ARENA_MIN_BALANCE_WEI = AGENT_MIN_BALANCE_WEI + ARENA_ENTRY_FEE_WEI;
 const AGENT_STATE_FILE_PATH = path.resolve(process.cwd(), AGENT_STATE_FILE);
 
 // Contract ABI
@@ -205,6 +216,10 @@ function pickDailyTxTarget() {
   return randomInt(AGENT_DAILY_TX_MIN, AGENT_DAILY_TX_MAX);
 }
 
+function pickArenaDailyTxTarget() {
+  return randomInt(ARENA_DAILY_TX_MIN, ARENA_DAILY_TX_MAX);
+}
+
 function refreshDailyTxBudget(now = new Date()) {
   const dayKey = getUtcDayKey(now);
   const budget = agentBehaviorState.dailyBudget;
@@ -250,6 +265,148 @@ function recordDailyTxSuccess(now = new Date()) {
   return budget;
 }
 
+function refreshArenaDailyTxBudget(now = new Date()) {
+  const dayKey = getUtcDayKey(now);
+  const budget = agentBehaviorState.arenaDailyBudget;
+
+  if (!budget || budget.dayKey !== dayKey) {
+    agentBehaviorState.arenaDailyBudget = {
+      dayKey,
+      targetTransactions: pickArenaDailyTxTarget(),
+      sentTransactions: 0,
+    };
+    saveAgentBehaviorState();
+  } else {
+    const normalizedTarget = Math.max(
+      ARENA_DAILY_TX_MIN,
+      Math.min(ARENA_DAILY_TX_MAX, Number(budget.targetTransactions || 0))
+    );
+    const normalizedSent = Math.max(0, Number(budget.sentTransactions || 0));
+    if (
+      normalizedTarget !== budget.targetTransactions ||
+      normalizedSent !== budget.sentTransactions
+    ) {
+      budget.targetTransactions = normalizedTarget;
+      budget.sentTransactions = normalizedSent;
+      saveAgentBehaviorState();
+    }
+  }
+
+  return agentBehaviorState.arenaDailyBudget;
+}
+
+function getArenaDailyTxRemaining(now = new Date()) {
+  const budget = refreshArenaDailyTxBudget(now);
+  return Math.max(0, budget.targetTransactions - budget.sentTransactions);
+}
+
+function recordArenaDailyTxSuccess(now = new Date()) {
+  const budget = refreshArenaDailyTxBudget(now);
+  budget.sentTransactions = Math.min(
+    budget.targetTransactions,
+    Number(budget.sentTransactions || 0) + 1
+  );
+  saveAgentBehaviorState();
+  return budget;
+}
+
+function pickRandomUniqueArenaHours(count) {
+  const targetCount = Math.max(0, Math.min(24, Number(count || 0)));
+  const hours = Array.from({ length: 24 }, (_, hour) => hour);
+
+  for (let i = hours.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [hours[i], hours[j]] = [hours[j], hours[i]];
+  }
+
+  return hours
+    .slice(0, targetCount)
+    .sort((a, b) => a - b)
+    .map(hour => ({
+      hour,
+      executedAt: null,
+      executedBy: null,
+    }));
+}
+
+function buildArenaSchedule(dayKey, targetTransactions) {
+  return {
+    dayKey,
+    slots: pickRandomUniqueArenaHours(targetTransactions),
+  };
+}
+
+function refreshArenaSchedule(now = new Date()) {
+  const budget = refreshArenaDailyTxBudget(now);
+  const dayKey = getUtcDayKey(now);
+  const targetTransactions = Math.max(
+    0,
+    Math.min(24, Number(budget?.targetTransactions || 0))
+  );
+  const schedule = agentBehaviorState.arenaSchedule;
+
+  if (
+    !schedule ||
+    schedule.dayKey !== dayKey ||
+    !Array.isArray(schedule.slots) ||
+    schedule.slots.length !== targetTransactions
+  ) {
+    agentBehaviorState.arenaSchedule = buildArenaSchedule(dayKey, targetTransactions);
+    saveAgentBehaviorState();
+  } else {
+    let changed = false;
+    for (const slot of schedule.slots) {
+      const normalizedHour = Math.max(0, Math.min(23, Number(slot.hour || 0)));
+      if (slot.hour !== normalizedHour) {
+        slot.hour = normalizedHour;
+        changed = true;
+      }
+      if (slot.executedAt !== null && typeof slot.executedAt !== 'string') {
+        slot.executedAt = null;
+        changed = true;
+      }
+      if (slot.executedBy !== null && typeof slot.executedBy !== 'string') {
+        slot.executedBy = null;
+        changed = true;
+      }
+    }
+
+    schedule.slots.sort((a, b) => a.hour - b.hour);
+    if (changed) {
+      saveAgentBehaviorState();
+    }
+  }
+
+  return agentBehaviorState.arenaSchedule;
+}
+
+function getCurrentArenaSlot(now = new Date()) {
+  const schedule = refreshArenaSchedule(now);
+  const currentUtcHour = now.getUTCHours();
+
+  return schedule.slots.find(slot => slot.hour === currentUtcHour && !slot.executedAt) || null;
+}
+
+function markArenaSlotExecuted(hour, agent, now = new Date()) {
+  const schedule = refreshArenaSchedule(now);
+  const slot = schedule.slots.find(entry => entry.hour === hour && !entry.executedAt);
+  if (!slot) {
+    return null;
+  }
+
+  slot.executedAt = now.toISOString();
+  slot.executedBy = normalizeAddress(agent.account.address);
+  saveAgentBehaviorState();
+  return slot;
+}
+
+function formatArenaScheduleHours(schedule = refreshArenaSchedule()) {
+  const hours = Array.isArray(schedule?.slots)
+    ? schedule.slots.map(slot => String(slot.hour).padStart(2, '0'))
+    : [];
+  return hours.length > 0 ? hours.join(', ') : 'none';
+}
+
 function getAgentPriorityBucket(agent, now = Date.now()) {
   const state = ensureAgentTracked(agent, now);
   const ageDays = getAgentAgeDays(state.firstSeenAt, now);
@@ -281,21 +438,27 @@ function buildRunQueueByPriority(now = Date.now()) {
 function loadAgentBehaviorState() {
   try {
     if (!fs.existsSync(AGENT_STATE_FILE_PATH)) {
-      return { agents: {}, dailyBudget: null };
+      return { agents: {}, dailyBudget: null, arenaDailyBudget: null, arenaSchedule: null };
     }
 
     const raw = fs.readFileSync(AGENT_STATE_FILE_PATH, 'utf8');
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || typeof parsed.agents !== 'object') {
-      return { agents: {}, dailyBudget: null };
+      return { agents: {}, dailyBudget: null, arenaDailyBudget: null, arenaSchedule: null };
     }
     if (!parsed.dailyBudget || typeof parsed.dailyBudget !== 'object') {
       parsed.dailyBudget = null;
     }
+    if (!parsed.arenaDailyBudget || typeof parsed.arenaDailyBudget !== 'object') {
+      parsed.arenaDailyBudget = null;
+    }
+    if (!parsed.arenaSchedule || typeof parsed.arenaSchedule !== 'object') {
+      parsed.arenaSchedule = null;
+    }
     return parsed;
   } catch (error) {
     console.warn(`Failed to read ${AGENT_STATE_FILE_PATH}, starting with empty state:`, error.message);
-    return { agents: {}, dailyBudget: null };
+    return { agents: {}, dailyBudget: null, arenaDailyBudget: null, arenaSchedule: null };
   }
 }
 
@@ -571,7 +734,7 @@ async function playArena(agent) {
     return null;
   }
 
-  console.log(`[${agent.name}] Playing 33balances as ${characterId} — result: ${resultLabel}`);
+  console.log(`[${agent.name}] Playing 33balances as ${characterId} - result: ${resultLabel}`);
 
   try {
     const { request } = await withRpcRetry(
@@ -610,6 +773,55 @@ async function playArena(agent) {
     }
 
     throw error;
+  }
+}
+
+async function maybePlayArena(agent) {
+  try {
+    if (!ARENA_ENABLED || agent.index >= ARENA_AGENTS_COUNT) {
+      return false;
+    }
+
+    const now = new Date();
+    const arenaSlot = getCurrentArenaSlot(now);
+    if (!arenaSlot) {
+      return false;
+    }
+
+    const arenaRemaining = getArenaDailyTxRemaining(now);
+    if (arenaRemaining <= 0) {
+      console.log(`[${agent.name}] Arena daily cap reached. Skipping 33balances.`);
+      return false;
+    }
+
+    const balanceWei = await getAgentBalanceWei(agent.account.address, `arenaBalance:${agent.name}`);
+    if (balanceWei < ARENA_MIN_BALANCE_WEI) {
+      console.log(
+        `[${agent.name}] Low ETH balance for arena: ${formatEther(balanceWei)} ETH (min ${formatEther(ARENA_MIN_BALANCE_WEI)} ETH). Skipping 33balances.`
+      );
+      return false;
+    }
+
+    const arenaDelayMs = randomInt(ARENA_ACTION_DELAY_MIN_MS, ARENA_ACTION_DELAY_MAX_MS);
+    console.log(
+      `[${agent.name}] Arena slot active for ${String(arenaSlot.hour).padStart(2, '0')}:00 UTC. Action delay: ${arenaDelayMs}ms`
+    );
+    await sleep(arenaDelayMs);
+
+    const arenaReceipt = await playArena(agent);
+    if (!arenaReceipt) {
+      return false;
+    }
+
+    const arenaBudget = recordArenaDailyTxSuccess();
+    markArenaSlotExecuted(arenaSlot.hour, agent);
+    console.log(
+      `[${agent.name}] Arena daily usage: ${arenaBudget.sentTransactions}/${arenaBudget.targetTransactions} (${arenaBudget.dayKey})`
+    );
+    return true;
+  } catch (error) {
+    console.error(`[${agent.name}] Arena scheduling error:`, error);
+    return false;
   }
 }
 
@@ -658,9 +870,11 @@ async function runAgent(agent, cycleContext = null) {
     console.log('Agent Address:', agent.account.address);
     console.log('='.repeat(50) + '\n');
 
+    await maybePlayArena(agent);
+
     if (cycleContext && cycleContext.sentTransactions >= cycleContext.maxTransactions) {
       console.log(
-        `[${agent.name}] Cycle tx budget reached (${cycleContext.sentTransactions}/${cycleContext.maxTransactions}), skipping.`
+        `[${agent.name}] Cycle tx budget reached (${cycleContext.sentTransactions}/${cycleContext.maxTransactions}), skipping Powell.`
       );
       return;
     }
@@ -771,32 +985,6 @@ async function runAgent(agent, cycleContext = null) {
       }
     }
 
-    if (ARENA_ENABLED && agent.index < ARENA_AGENTS_COUNT) {
-      const arenaDelayMs = randomInt(2000, 5000);
-      console.log(`[${agent.name}] Arena action delay: ${arenaDelayMs}ms`);
-      await sleep(arenaDelayMs);
-
-      try {
-        const arenaReceipt = await playArena(agent);
-        if (arenaReceipt) {
-          if (cycleContext) {
-            const dailyBudget = recordDailyTxSuccess();
-            cycleContext.sentTransactions += 1;
-            console.log(
-              `[${agent.name}] Cycle tx usage: ${cycleContext.sentTransactions}/${cycleContext.maxTransactions}`
-            );
-            console.log(
-              `[${agent.name}] Daily tx usage: ${dailyBudget.sentTransactions}/${dailyBudget.targetTransactions} (${dailyBudget.dayKey})`
-            );
-          } else {
-            recordDailyTxSuccess();
-          }
-        }
-      } catch {
-        // Arena is best-effort and must not fail the main agent run.
-      }
-    }
-
     console.log(`\n[${agent.name}] Agent run completed successfully!\n`);
   } catch (error) {
     console.error(`[${agent.name}] Agent error:`, error);
@@ -861,13 +1049,6 @@ async function runAllAgents(mode) {
   for (let i = 0; i < runQueue.length; i++) {
     const agent = runQueue[i];
 
-    if (mode === 'run' && cycleContext.sentTransactions >= cycleContext.maxTransactions) {
-      console.log(
-        `Cycle tx budget reached (${cycleContext.sentTransactions}/${cycleContext.maxTransactions}). Ending this cycle early.`
-      );
-      break;
-    }
-
     try {
       if (mode === 'status') {
         await checkStatus(agent);
@@ -899,6 +1080,15 @@ async function startAgent() {
     console.log('WARNING: Duplicate agent addresses detected. Use unique private keys for true multi-agent behavior.');
   }
   console.log('Contract:', CONTRACT_ADDRESS);
+  console.log('Arena gameplay:', ARENA_ENABLED ? 'enabled' : 'disabled');
+  console.log(
+    'Arena eligible agents:',
+    ARENA_AGENTS_COUNT === Number.MAX_SAFE_INTEGER ? 'all' : `${ARENA_AGENTS_COUNT}`
+  );
+  console.log('Arena contract:', ARENA_CONTRACT_ADDRESS);
+  console.log('Arena daily target range:', `${ARENA_DAILY_TX_MIN}-${ARENA_DAILY_TX_MAX} tx`);
+  console.log('Arena action delay range:', `${ARENA_ACTION_DELAY_MIN_MS}-${ARENA_ACTION_DELAY_MAX_MS}ms`);
+  console.log('Arena schedule timezone:', 'UTC hour windows');
   console.log('Farcaster posting:', FARCASTER_POSTS_ENABLED ? 'enabled' : 'disabled');
   console.log('Farcaster posting mode:', 'success-only');
   console.log('Farcaster success post limit:', `${FARCASTER_MAX_SUCCESS_POSTS_PER_DAY} per UTC day`);
@@ -920,6 +1110,14 @@ async function startAgent() {
     'Daily tx budget state:',
     `${dailyBudget.sentTransactions}/${dailyBudget.targetTransactions} (${dailyBudget.dayKey})`
   );
+  if (ARENA_ENABLED) {
+    const arenaDailyBudget = refreshArenaDailyTxBudget();
+    console.log(
+      'Arena daily budget state:',
+      `${arenaDailyBudget.sentTransactions}/${arenaDailyBudget.targetTransactions} (${arenaDailyBudget.dayKey})`
+    );
+    console.log('Arena schedule hours (UTC):', formatArenaScheduleHours());
+  }
   if (TX_DATA_SUFFIX) {
     const attributionSource = BUILDER_DATA_SUFFIX ? 'BUILDER_DATA_SUFFIX' : 'BUILDER_CODE(S)';
     console.log('Attribution source:', attributionSource);
