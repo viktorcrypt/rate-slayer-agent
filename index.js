@@ -36,7 +36,11 @@ const ARENA_ACTION_DELAY_MAX_MS = Math.max(
   ARENA_ACTION_DELAY_MIN_MS,
   Number(process.env.ARENA_ACTION_DELAY_MAX_MS || 5000)
 );
+const ARENA_DEBUG_LOGS = String(process.env.ARENA_DEBUG_LOGS || 'true').toLowerCase() === 'true';
 const AGENT_RUN_STAGGER_MS = Math.max(0, Number(process.env.AGENT_RUN_STAGGER_MS || 3000));
+const LOG_AGENT_SKIPS = String(process.env.LOG_AGENT_SKIPS || 'false').toLowerCase() === 'true';
+const LOG_AGENT_ADDRESSES = String(process.env.LOG_AGENT_ADDRESSES || 'false').toLowerCase() === 'true';
+const LOG_AGENT_STAGGER_WAIT = String(process.env.LOG_AGENT_STAGGER_WAIT || 'false').toLowerCase() === 'true';
 const NEYNAR_API_KEY = process.env.NEYNAR_API_KEY;
 const FARCASTER_SIGNER_UUID = process.env.FARCASTER_SIGNER_UUID;
 const FARCASTER_POSTS_ENABLED = String(process.env.FARCASTER_POSTS_ENABLED || 'false').toLowerCase() === 'true';
@@ -240,6 +244,10 @@ const farcasterPostState = {
   dayKey: '',
   successPostsToday: 0,
 };
+const arenaDebugState = {
+  lastHourStatusKey: '',
+  lastLowBalanceHourKey: '',
+};
 
 function randomInt(min, max) {
   if (max <= min) {
@@ -250,6 +258,19 @@ function randomInt(min, max) {
 
 function pickRandom(items) {
   return items[Math.floor(Math.random() * items.length)];
+}
+
+function shortAddress(address) {
+  if (!address) {
+    return 'unknown';
+  }
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+function logAgentSkip(message) {
+  if (LOG_AGENT_SKIPS) {
+    console.log(message);
+  }
 }
 
 function normalizeAddress(address) {
@@ -449,6 +470,74 @@ function formatArenaScheduleHours(schedule = refreshArenaSchedule()) {
     ? schedule.slots.map(slot => String(slot.hour).padStart(2, '0'))
     : [];
   return hours.length > 0 ? hours.join(', ') : 'none';
+}
+
+function formatUtcHourLabel(hour) {
+  return `${String(hour).padStart(2, '0')}:00 UTC`;
+}
+
+function formatArenaHourList(hours) {
+  return hours.length > 0
+    ? hours.map(hour => formatUtcHourLabel(hour)).join(', ')
+    : 'none';
+}
+
+function getRemainingArenaHours(schedule, now = new Date()) {
+  const currentUtcHour = now.getUTCHours();
+  return schedule.slots
+    .filter(slot => !slot.executedAt && slot.hour >= currentUtcHour)
+    .map(slot => slot.hour);
+}
+
+function logArenaHourStatus(now = new Date()) {
+  if (!ARENA_ENABLED || !ARENA_DEBUG_LOGS) {
+    return;
+  }
+
+  const hourStatusKey = `${getUtcDayKey(now)}:${now.getUTCHours()}`;
+  if (arenaDebugState.lastHourStatusKey === hourStatusKey) {
+    return;
+  }
+  arenaDebugState.lastHourStatusKey = hourStatusKey;
+
+  const schedule = refreshArenaSchedule(now);
+  const currentUtcHour = now.getUTCHours();
+  const currentSlot = schedule.slots.find(slot => slot.hour === currentUtcHour) || null;
+  const remainingHours = getRemainingArenaHours(schedule, now);
+
+  if (currentSlot?.executedAt) {
+    console.log(
+      `[arena] Slot ${formatUtcHourLabel(currentUtcHour)} already executed by ${shortAddress(currentSlot.executedBy)}. Remaining today: ${formatArenaHourList(remainingHours)}`
+    );
+    return;
+  }
+
+  if (currentSlot) {
+    console.log(
+      `[arena] Active slot ${formatUtcHourLabel(currentUtcHour)}. Remaining today: ${formatArenaHourList(remainingHours)}`
+    );
+    return;
+  }
+
+  console.log(
+    `[arena] No active slot at ${formatUtcHourLabel(currentUtcHour)}. Remaining today: ${formatArenaHourList(remainingHours)}`
+  );
+}
+
+function logArenaLowBalance(agent, balanceWei, now = new Date()) {
+  if (!ARENA_DEBUG_LOGS) {
+    return;
+  }
+
+  const hourStatusKey = `${getUtcDayKey(now)}:${now.getUTCHours()}`;
+  if (arenaDebugState.lastLowBalanceHourKey === hourStatusKey) {
+    return;
+  }
+  arenaDebugState.lastLowBalanceHourKey = hourStatusKey;
+
+  console.log(
+    `[arena] First low-balance miss in ${formatUtcHourLabel(now.getUTCHours())}: ${agent.name} ${shortAddress(agent.account.address)} has ${formatEther(balanceWei)} ETH, needs at least ${formatEther(ARENA_MIN_BALANCE_WEI)} ETH.`
+  );
 }
 
 function getAgentPriorityBucket(agent, now = Date.now()) {
@@ -789,7 +878,7 @@ async function playArena(agent) {
         functionName: 'enterMatch',
         args: [characterId, won],
         value: parseEther('0.00001'),
-        ...(TX_DATA_SUFFIX ? { dataSuffix: TX_DATA_SUFFIX } : {}),
+        ...(ARENA_TX_DATA_SUFFIX ? { dataSuffix: ARENA_TX_DATA_SUFFIX } : {}),
       }),
       `simulateArena:${agent.name}`
     );
@@ -822,11 +911,17 @@ async function playArena(agent) {
 
 async function maybePlayArena(agent) {
   try {
-    if (!ARENA_ENABLED || agent.index >= ARENA_AGENTS_COUNT) {
+    if (!ARENA_ENABLED) {
       return false;
     }
 
     const now = new Date();
+    logArenaHourStatus(now);
+
+    if (agent.index >= ARENA_AGENTS_COUNT) {
+      return false;
+    }
+
     const arenaSlot = getCurrentArenaSlot(now);
     if (!arenaSlot) {
       return false;
@@ -834,15 +929,12 @@ async function maybePlayArena(agent) {
 
     const arenaRemaining = getArenaDailyTxRemaining(now);
     if (arenaRemaining <= 0) {
-      console.log(`[${agent.name}] Arena daily cap reached. Skipping 33balances.`);
       return false;
     }
 
     const balanceWei = await getAgentBalanceWei(agent.account.address, `arenaBalance:${agent.name}`);
     if (balanceWei < ARENA_MIN_BALANCE_WEI) {
-      console.log(
-        `[${agent.name}] Low ETH balance for arena: ${formatEther(balanceWei)} ETH (min ${formatEther(ARENA_MIN_BALANCE_WEI)} ETH). Skipping 33balances.`
-      );
+      logArenaLowBalance(agent, balanceWei, now);
       return false;
     }
 
@@ -908,16 +1000,10 @@ async function postToFarcaster(text) {
 
 async function runAgent(agent, cycleContext = null) {
   try {
-    console.log('\n' + '='.repeat(50));
-    console.log(`${agent.name} running...`);
-    console.log('Time:', new Date().toLocaleString());
-    console.log('Agent Address:', agent.account.address);
-    console.log('='.repeat(50) + '\n');
-
     await maybePlayArena(agent);
 
     if (cycleContext && cycleContext.sentTransactions >= cycleContext.maxTransactions) {
-      console.log(
+      logAgentSkip(
         `[${agent.name}] Cycle tx budget reached (${cycleContext.sentTransactions}/${cycleContext.maxTransactions}), skipping Powell.`
       );
       return;
@@ -925,7 +1011,7 @@ async function runAgent(agent, cycleContext = null) {
 
     const balanceWei = await getAgentBalanceWei(agent.account.address, `balance:${agent.name}`);
     if (balanceWei < AGENT_MIN_BALANCE_WEI) {
-      console.log(
+      logAgentSkip(
         `[${agent.name}] Low ETH balance: ${formatEther(balanceWei)} ETH (min ${AGENT_MIN_BALANCE_ETH} ETH). Skipping run.`
       );
       return;
@@ -936,8 +1022,7 @@ async function runAgent(agent, cycleContext = null) {
     if (cooldown > 0) {
       const minutes = Math.floor(cooldown / 60);
       const seconds = cooldown % 60;
-      console.log(`[${agent.name}] Cooldown active: ${minutes}m ${seconds}s remaining`);
-      console.log('Skipping this run...\n');
+      logAgentSkip(`[${agent.name}] Cooldown active: ${minutes}m ${seconds}s remaining`);
       return;
     }
 
@@ -945,7 +1030,7 @@ async function runAgent(agent, cycleContext = null) {
     if (skipRoll < AGENT_RANDOM_SKIP_CHANCE) {
       const rollPct = (skipRoll * 100).toFixed(1);
       const thresholdPct = (AGENT_RANDOM_SKIP_CHANCE * 100).toFixed(1);
-      console.log(
+      logAgentSkip(
         `[${agent.name}] Random skip this cycle (roll ${rollPct}% < threshold ${thresholdPct}%)`
       );
       return;
@@ -956,7 +1041,7 @@ async function runAgent(agent, cycleContext = null) {
     if (ageRoll > actionChance) {
       const rollPct = (ageRoll * 100).toFixed(1);
       const chancePct = (actionChance * 100).toFixed(1);
-      console.log(
+      logAgentSkip(
         `[${agent.name}] Age-weighted skip (age ${ageDays}d, roll ${rollPct}% > chance ${chancePct}%).`
       );
       return;
@@ -964,7 +1049,6 @@ async function runAgent(agent, cycleContext = null) {
 
     const actionDelayMs = randomInt(AGENT_ACTION_DELAY_MIN_MS, AGENT_ACTION_DELAY_MAX_MS);
     if (actionDelayMs > 0) {
-      console.log(`[${agent.name}] Random action delay: ${actionDelayMs}ms`);
       await sleep(actionDelayMs);
     }
 
@@ -976,7 +1060,7 @@ async function runAgent(agent, cycleContext = null) {
     if (readyCooldown > 0) {
       const minutes = Math.floor(readyCooldown / 60);
       const seconds = readyCooldown % 60;
-      console.log(`[${agent.name}] Cooldown became active after delay: ${minutes}m ${seconds}s`);
+      logAgentSkip(`[${agent.name}] Cooldown became active after delay: ${minutes}m ${seconds}s`);
       return;
     }
 
@@ -1017,11 +1101,7 @@ async function runAgent(agent, cycleContext = null) {
       `${castPersona} executed press().\n\nFed Rate: ${rateBefore.toFixed(2)}% -> ${rateAfter.toFixed(2)}%\nHit #${pressesAfter}\n\n${APP_URL}`,
     ];
 
-    if (!FARCASTER_POSTS_ENABLED) {
-      console.log('Skipping Farcaster post (disabled)');
-    } else if (!canPostSuccessToFarcaster()) {
-      console.log('Skipping Farcaster post (daily success post limit reached)');
-    } else {
+    if (FARCASTER_POSTS_ENABLED && canPostSuccessToFarcaster()) {
       const randomMessage = messages[Math.floor(Math.random() * messages.length)];
       const postResult = await postToFarcaster(randomMessage);
       if (postResult) {
@@ -1036,9 +1116,9 @@ async function runAgent(agent, cycleContext = null) {
     if (isInsufficientFundsError(error)) {
       console.log(`[${agent.name}] Insufficient ETH for gas. Top up this wallet to resume actions.`);
     } else if (String(error?.message || '').includes('cooldown')) {
-      console.log('Cooldown error - this is normal, will try next hour');
+      logAgentSkip('Cooldown error - this is normal, will try next hour');
     } else {
-      console.log('Skipping Farcaster error post (success-only mode)');
+      console.log(`[${agent.name}] Agent run failed.`);
     }
   }
 }
@@ -1105,7 +1185,9 @@ async function runAllAgents(mode) {
 
     const shouldWait = i < runQueue.length - 1 && AGENT_RUN_STAGGER_MS > 0;
     if (shouldWait) {
-      console.log(`Waiting ${AGENT_RUN_STAGGER_MS}ms before next agent...`);
+      if (LOG_AGENT_STAGGER_WAIT) {
+        console.log(`Waiting ${AGENT_RUN_STAGGER_MS}ms before next agent...`);
+      }
       await sleep(AGENT_RUN_STAGGER_MS);
     }
   }
@@ -1116,8 +1198,10 @@ async function startAgent() {
   console.log('\nRate Slayer Agent Started!\n');
   console.log('Will run every hour on the hour');
   console.log('Agents configured:', agents.length);
-  for (const agent of agents) {
-    console.log(`Agent ${agent.name}: ${agent.account.address}`);
+  if (LOG_AGENT_ADDRESSES) {
+    for (const agent of agents) {
+      console.log(`Agent ${agent.name}: ${agent.account.address}`);
+    }
   }
   const uniqueAgentCount = new Set(agents.map(agent => agent.account.address.toLowerCase())).size;
   if (uniqueAgentCount !== agents.length) {
@@ -1133,6 +1217,7 @@ async function startAgent() {
   console.log('Arena daily target range:', `${ARENA_DAILY_TX_MIN}-${ARENA_DAILY_TX_MAX} tx`);
   console.log('Arena action delay range:', `${ARENA_ACTION_DELAY_MIN_MS}-${ARENA_ACTION_DELAY_MAX_MS}ms`);
   console.log('Arena schedule timezone:', 'UTC hour windows');
+  console.log('Arena debug logs:', ARENA_DEBUG_LOGS ? 'enabled' : 'disabled');
   console.log('Farcaster posting:', FARCASTER_POSTS_ENABLED ? 'enabled' : 'disabled');
   console.log('Farcaster posting mode:', 'success-only');
   console.log('Farcaster success post limit:', `${FARCASTER_MAX_SUCCESS_POSTS_PER_DAY} per UTC day`);
@@ -1150,6 +1235,8 @@ async function startAgent() {
   console.log('Min agent gas balance:', `${AGENT_MIN_BALANCE_ETH} ETH`);
   console.log('Run immediately on startup:', RUN_ON_START ? 'enabled' : 'disabled');
   console.log('Agent behavior state file:', AGENT_STATE_FILE_PATH);
+  console.log('Skip logs:', LOG_AGENT_SKIPS ? 'enabled' : 'disabled');
+  console.log('Agent address logs:', LOG_AGENT_ADDRESSES ? 'enabled' : 'disabled');
   const dailyBudget = refreshDailyTxBudget();
   console.log(
     'Daily tx budget state:',
