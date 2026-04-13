@@ -11,7 +11,7 @@ dotenv.config();
 
 
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || '0xeC6AF3c5934F383972bb9980A51EC976099270b8';
-const ARENA_CONTRACT_ADDRESS = process.env.ARENA_CONTRACT_ADDRESS || '0x09C1FaD72f10c0Dd4C083A28990Faa8A7C8F0580';
+const ARENA_CONTRACT_ADDRESS = process.env.ARENA_CONTRACT_ADDRESS || '0x918C7a5209449715CFd78BceF3C2BCBaaAd9CBB9';
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const AGENT_PRIVATE_KEYS = (process.env.AGENT_PRIVATE_KEYS || '')
   .split(',')
@@ -29,8 +29,19 @@ const ARENA_CHARACTERS = (process.env.ARENA_CHARACTERS || 'trump,vitalik,satoshi
   .split(',')
   .map(characterId => characterId.trim())
   .filter(Boolean);
-const ARENA_DAILY_TX_MIN = Math.max(0, Number(process.env.ARENA_DAILY_TX_MIN || 4));
-const ARENA_DAILY_TX_MAX = Math.max(ARENA_DAILY_TX_MIN, Number(process.env.ARENA_DAILY_TX_MAX || 5));
+const DEFAULT_ARENA_DAILY_TX_MIN = Math.max(1, Number(process.env.AGENT_DAILY_TX_MIN || 15));
+const DEFAULT_ARENA_DAILY_TX_MAX = Math.max(
+  DEFAULT_ARENA_DAILY_TX_MIN,
+  Number(process.env.AGENT_DAILY_TX_MAX || 20)
+);
+const ARENA_DAILY_TX_MIN = Math.max(
+  0,
+  Number(process.env.ARENA_DAILY_TX_MIN || DEFAULT_ARENA_DAILY_TX_MIN)
+);
+const ARENA_DAILY_TX_MAX = Math.max(
+  ARENA_DAILY_TX_MIN,
+  Number(process.env.ARENA_DAILY_TX_MAX || DEFAULT_ARENA_DAILY_TX_MAX)
+);
 const ARENA_ACTION_DELAY_MIN_MS = Math.max(0, Number(process.env.ARENA_ACTION_DELAY_MIN_MS || 2000));
 const ARENA_ACTION_DELAY_MAX_MS = Math.max(
   ARENA_ACTION_DELAY_MIN_MS,
@@ -101,8 +112,7 @@ try {
 } catch {
   throw new Error(`Invalid AGENT_MIN_BALANCE_ETH value: "${AGENT_MIN_BALANCE_ETH}"`);
 }
-const ARENA_ENTRY_FEE_WEI = parseEther('0.00001');
-const ARENA_MIN_BALANCE_WEI = AGENT_MIN_BALANCE_WEI + ARENA_ENTRY_FEE_WEI;
+const ARENA_MIN_BALANCE_WEI = AGENT_MIN_BALANCE_WEI;
 const AGENT_STATE_FILE_PATH = path.resolve(process.cwd(), AGENT_STATE_FILE);
 
 // Contract ABI
@@ -118,7 +128,7 @@ const CONTRACT_ABI = parseAbi([
   'function MAX_RATE() view returns (uint256)',
 ]);
 const ARENA_ABI = parseAbi([
-  'function enterMatch(string characterId, bool won) payable',
+  'function enterMatch(string characterId, bool won)',
 ]);
 
 
@@ -375,67 +385,90 @@ function recordArenaDailyTxSuccess(now = new Date()) {
   return budget;
 }
 
-function pickRandomUniqueArenaHours(count) {
-  const targetCount = Math.max(0, Math.min(24, Number(count || 0)));
-  const hours = Array.from({ length: 24 }, (_, hour) => hour);
+function pickRandomArenaHourSlots(count) {
+  const targetCount = Math.max(0, Math.floor(Number(count || 0)));
+  const hourlyCounts = Array.from({ length: 24 }, () => 0);
 
-  for (let i = hours.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [hours[i], hours[j]] = [hours[j], hours[i]];
+  for (let index = 0; index < targetCount; index += 1) {
+    const hour = randomInt(0, 23);
+    hourlyCounts[hour] += 1;
   }
 
-  return hours
-    .slice(0, targetCount)
-    .sort((a, b) => a - b)
-    .map(hour => ({
+  return hourlyCounts
+    .map((targetTransactions, hour) => ({
       hour,
-      executedAt: null,
-      executedBy: null,
-    }));
+      targetTransactions,
+      sentTransactions: 0,
+      lastExecutedAt: null,
+      lastExecutedBy: null,
+    }))
+    .filter(slot => slot.targetTransactions > 0);
 }
 
 function buildArenaSchedule(dayKey, targetTransactions) {
   return {
     dayKey,
-    slots: pickRandomUniqueArenaHours(targetTransactions),
+    slots: pickRandomArenaHourSlots(targetTransactions),
   };
+}
+
+function getArenaScheduleTargetTransactions(schedule) {
+  if (!Array.isArray(schedule?.slots)) {
+    return 0;
+  }
+
+  return schedule.slots.reduce(
+    (sum, slot) => sum + Math.max(0, Math.floor(Number(slot?.targetTransactions || 0))),
+    0
+  );
+}
+
+function getArenaSlotRemainingCount(slot) {
+  const targetTransactions = Math.max(0, Math.floor(Number(slot?.targetTransactions || 0)));
+  const sentTransactions = Math.max(0, Math.floor(Number(slot?.sentTransactions || 0)));
+  return Math.max(0, targetTransactions - sentTransactions);
+}
+
+function isArenaScheduleValid(schedule, dayKey, targetTransactions) {
+  if (!schedule || schedule.dayKey !== dayKey || !Array.isArray(schedule.slots)) {
+    return false;
+  }
+
+  if (getArenaScheduleTargetTransactions(schedule) !== targetTransactions) {
+    return false;
+  }
+
+  return schedule.slots.every(slot => {
+    const hour = Number(slot?.hour);
+    const slotTarget = Number(slot?.targetTransactions);
+    const slotSent = Number(slot?.sentTransactions);
+
+    return (
+      Number.isInteger(hour) &&
+      hour >= 0 &&
+      hour <= 23 &&
+      Number.isInteger(slotTarget) &&
+      slotTarget > 0 &&
+      Number.isInteger(slotSent) &&
+      slotSent >= 0 &&
+      slotSent <= slotTarget &&
+      (slot.lastExecutedAt === null || typeof slot.lastExecutedAt === 'string') &&
+      (slot.lastExecutedBy === null || typeof slot.lastExecutedBy === 'string')
+    );
+  });
 }
 
 function refreshArenaSchedule(now = new Date()) {
   const budget = refreshArenaDailyTxBudget(now);
   const dayKey = getUtcDayKey(now);
-  const targetTransactions = Math.max(
-    0,
-    Math.min(24, Number(budget?.targetTransactions || 0))
-  );
+  const targetTransactions = Math.max(0, Math.floor(Number(budget?.targetTransactions || 0)));
   const schedule = agentBehaviorState.arenaSchedule;
 
-  if (
-    !schedule ||
-    schedule.dayKey !== dayKey ||
-    !Array.isArray(schedule.slots) ||
-    schedule.slots.length !== targetTransactions
-  ) {
+  if (!isArenaScheduleValid(schedule, dayKey, targetTransactions)) {
     agentBehaviorState.arenaSchedule = buildArenaSchedule(dayKey, targetTransactions);
     saveAgentBehaviorState();
   } else {
-    let changed = false;
-    for (const slot of schedule.slots) {
-      const normalizedHour = Math.max(0, Math.min(23, Number(slot.hour || 0)));
-      if (slot.hour !== normalizedHour) {
-        slot.hour = normalizedHour;
-        changed = true;
-      }
-      if (slot.executedAt !== null && typeof slot.executedAt !== 'string') {
-        slot.executedAt = null;
-        changed = true;
-      }
-      if (slot.executedBy !== null && typeof slot.executedBy !== 'string') {
-        slot.executedBy = null;
-        changed = true;
-      }
-    }
-
+    const changed = schedule.slots.some((slot, index, slots) => index > 0 && slots[index - 1].hour > slot.hour);
     schedule.slots.sort((a, b) => a.hour - b.hour);
     if (changed) {
       saveAgentBehaviorState();
@@ -449,25 +482,33 @@ function getCurrentArenaSlot(now = new Date()) {
   const schedule = refreshArenaSchedule(now);
   const currentUtcHour = now.getUTCHours();
 
-  return schedule.slots.find(slot => slot.hour === currentUtcHour && !slot.executedAt) || null;
+  return schedule.slots.find(slot => slot.hour === currentUtcHour && getArenaSlotRemainingCount(slot) > 0) || null;
 }
 
 function markArenaSlotExecuted(hour, agent, now = new Date()) {
   const schedule = refreshArenaSchedule(now);
-  const slot = schedule.slots.find(entry => entry.hour === hour && !entry.executedAt);
+  const slot = schedule.slots.find(entry => entry.hour === hour && getArenaSlotRemainingCount(entry) > 0);
   if (!slot) {
     return null;
   }
 
-  slot.executedAt = now.toISOString();
-  slot.executedBy = normalizeAddress(agent.account.address);
+  slot.sentTransactions = Math.min(
+    Math.max(0, Math.floor(Number(slot.targetTransactions || 0))),
+    Math.max(0, Math.floor(Number(slot.sentTransactions || 0))) + 1
+  );
+  slot.lastExecutedAt = now.toISOString();
+  slot.lastExecutedBy = normalizeAddress(agent.account.address);
   saveAgentBehaviorState();
   return slot;
 }
 
 function formatArenaScheduleHours(schedule = refreshArenaSchedule()) {
   const hours = Array.isArray(schedule?.slots)
-    ? schedule.slots.map(slot => String(slot.hour).padStart(2, '0'))
+    ? schedule.slots.map(slot => {
+      const hourLabel = String(slot.hour).padStart(2, '0');
+      const targetTransactions = Math.max(0, Math.floor(Number(slot.targetTransactions || 0)));
+      return targetTransactions > 1 ? `${hourLabel}x${targetTransactions}` : hourLabel;
+    })
     : [];
   return hours.length > 0 ? hours.join(', ') : 'none';
 }
@@ -476,17 +517,19 @@ function formatUtcHourLabel(hour) {
   return `${String(hour).padStart(2, '0')}:00 UTC`;
 }
 
-function formatArenaHourList(hours) {
-  return hours.length > 0
-    ? hours.map(hour => formatUtcHourLabel(hour)).join(', ')
-    : 'none';
+function formatArenaHourList(labels) {
+  return labels.length > 0 ? labels.join(', ') : 'none';
 }
 
 function getRemainingArenaHours(schedule, now = new Date()) {
   const currentUtcHour = now.getUTCHours();
   return schedule.slots
-    .filter(slot => !slot.executedAt && slot.hour >= currentUtcHour)
-    .map(slot => slot.hour);
+    .filter(slot => getArenaSlotRemainingCount(slot) > 0 && slot.hour >= currentUtcHour)
+    .map(slot => {
+      const remainingCount = getArenaSlotRemainingCount(slot);
+      const hourLabel = formatUtcHourLabel(slot.hour);
+      return remainingCount > 1 ? `${hourLabel} x${remainingCount}` : hourLabel;
+    });
 }
 
 function logArenaHourStatus(now = new Date()) {
@@ -502,19 +545,21 @@ function logArenaHourStatus(now = new Date()) {
 
   const schedule = refreshArenaSchedule(now);
   const currentUtcHour = now.getUTCHours();
-  const currentSlot = schedule.slots.find(slot => slot.hour === currentUtcHour) || null;
+  const currentHourSlot = schedule.slots.find(slot => slot.hour === currentUtcHour) || null;
+  const currentSlot = getCurrentArenaSlot(now);
   const remainingHours = getRemainingArenaHours(schedule, now);
 
-  if (currentSlot?.executedAt) {
+  if (currentHourSlot && getArenaSlotRemainingCount(currentHourSlot) <= 0) {
     console.log(
-      `[arena] Slot ${formatUtcHourLabel(currentUtcHour)} already executed by ${shortAddress(currentSlot.executedBy)}. Remaining today: ${formatArenaHourList(remainingHours)}`
+      `[arena] Slot ${formatUtcHourLabel(currentUtcHour)} filled by ${shortAddress(currentHourSlot.lastExecutedBy)}. Remaining today: ${formatArenaHourList(remainingHours)}`
     );
     return;
   }
 
   if (currentSlot) {
+    const remainingThisHour = getArenaSlotRemainingCount(currentSlot);
     console.log(
-      `[arena] Active slot ${formatUtcHourLabel(currentUtcHour)}. Remaining today: ${formatArenaHourList(remainingHours)}`
+      `[arena] Active slot ${formatUtcHourLabel(currentUtcHour)} (${remainingThisHour} remaining this hour). Remaining today: ${formatArenaHourList(remainingHours)}`
     );
     return;
   }
@@ -877,7 +922,6 @@ async function playArena(agent) {
         abi: ARENA_ABI,
         functionName: 'enterMatch',
         args: [characterId, won],
-        value: parseEther('0.00001'),
         ...(ARENA_TX_DATA_SUFFIX ? { dataSuffix: ARENA_TX_DATA_SUFFIX } : {}),
       }),
       `simulateArena:${agent.name}`
@@ -900,7 +944,7 @@ async function playArena(agent) {
     console.error(`[${agent.name}] 33balances error:`, error);
 
     if (isInsufficientFundsError(error)) {
-      console.log(`[${agent.name}] Insufficient ETH for 33balances entry. Top up this wallet to resume arena actions.`);
+      console.log(`[${agent.name}] Insufficient ETH for 33balances transaction gas. Top up this wallet to resume arena actions.`);
     } else {
       console.log(`[${agent.name}] Skipping 33balances for this run.`);
     }
@@ -1216,7 +1260,7 @@ async function startAgent() {
   console.log('Arena contract:', ARENA_CONTRACT_ADDRESS);
   console.log('Arena daily target range:', `${ARENA_DAILY_TX_MIN}-${ARENA_DAILY_TX_MAX} tx`);
   console.log('Arena action delay range:', `${ARENA_ACTION_DELAY_MIN_MS}-${ARENA_ACTION_DELAY_MAX_MS}ms`);
-  console.log('Arena schedule timezone:', 'UTC hour windows');
+  console.log('Arena schedule timezone:', 'UTC hour slots');
   console.log('Arena debug logs:', ARENA_DEBUG_LOGS ? 'enabled' : 'disabled');
   console.log('Farcaster posting:', FARCASTER_POSTS_ENABLED ? 'enabled' : 'disabled');
   console.log('Farcaster posting mode:', 'success-only');
@@ -1248,7 +1292,7 @@ async function startAgent() {
       'Arena daily budget state:',
       `${arenaDailyBudget.sentTransactions}/${arenaDailyBudget.targetTransactions} (${arenaDailyBudget.dayKey})`
     );
-    console.log('Arena schedule hours (UTC):', formatArenaScheduleHours());
+    console.log('Arena schedule slots (UTC):', formatArenaScheduleHours());
   }
   if (TX_DATA_SUFFIX) {
     console.log('Powell attribution source:', TX_ATTRIBUTION_SOURCE);
